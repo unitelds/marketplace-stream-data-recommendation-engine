@@ -1,0 +1,9 @@
+# Python packages used in production environment
+pydantic
+pydantic-settings
+python-dotenv
+sqlalchemy
+oracledb
+loguru
+pandas
+trino
