@@ -1,0 +1,309 @@
+"""
+Hybrid ranker: merge content-based and popularity candidates, then apply
+layered context re-rankers to produce a final top-N recommendation list.
+
+Re-ranking pipeline (applied in order):
+  1. Merge CBF + popularity via Reciprocal Rank Fusion (RRF)
+  2. Remove OOS products and already-purchased products
+  3. Session taxon boost — promote products matching user's browse path
+  4. Basket-aware re-rank — boost cross-category complements, penalize duplicates
+  5. Limit-check price filter — demote products above the user's checked limit
+  6. Intent-level adjustment — high-intent users get conversion-optimised list
+  7. Device-type top-N truncation
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from loguru import logger
+
+from src.module.content_based import get_similar_products, get_taxon_products
+from src.module.feature_store import store
+from src.module.intent_scorer import PRICE_RANGE_ORDINAL
+
+# ─── RRF parameters ───────────────────────────────────────────────────────────
+RRF_K = 60
+WEIGHT_CBF = 0.6
+WEIGHT_POPULAR = 0.4
+
+# ─── Device → max results ─────────────────────────────────────────────────────
+DEVICE_TOP_N = {
+    "miniprogram": 8,
+    "mobile": 12,
+    "desktop": 20,
+    "unknown": 15,
+}
+
+# ─── Intent thresholds ────────────────────────────────────────────────────────
+HIGH_INTENT_THRESHOLD = 8.0
+LOW_INTENT_THRESHOLD = 2.0
+
+
+def _rrf_merge(
+    list_a: list[tuple[str, float]],
+    list_b: list[tuple[str, float]],
+    weight_a: float = WEIGHT_CBF,
+    weight_b: float = WEIGHT_POPULAR,
+) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion of two ranked candidate lists."""
+    scores: dict[str, float] = {}
+    for rank, (pid, _) in enumerate(list_a):
+        scores[pid] = scores.get(pid, 0.0) + weight_a / (RRF_K + rank + 1)
+    for rank, (pid, _) in enumerate(list_b):
+        scores[pid] = scores.get(pid, 0.0) + weight_b / (RRF_K + rank + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+def _session_taxon_boost(
+    candidates: list[tuple[str, float]],
+    taxon_path: list[str],
+    boost_factor: float = 0.25,
+) -> list[tuple[str, float]]:
+    """Boost products whose taxon appears in the session browse path (last 3)."""
+    if not taxon_path:
+        return candidates
+    recent = set(taxon_path[-3:])
+    result = []
+    for pid, score in candidates:
+        feat = store.product_features.get(pid, {})
+        if feat.get("taxon_id") in recent:
+            score = score * (1.0 + boost_factor)
+        result.append((pid, score))
+    return sorted(result, key=lambda x: x[1], reverse=True)
+
+
+def _basket_aware_rerank(
+    candidates: list[tuple[str, float]],
+    basket_product_ids: list[str],
+    penalize_same_category: bool = True,
+) -> list[tuple[str, float]]:
+    """
+    Basket-aware re-ranking:
+      - Boost products from different categories (cross-sell)
+      - Penalize products in the same exact product_category as basket items
+    """
+    if not basket_product_ids:
+        return candidates
+
+    basket_categories = set()
+    basket_taxons = set()
+    for bpid in basket_product_ids:
+        feat = store.product_features.get(bpid, {})
+        cat = feat.get("product_category", "")
+        taxon = feat.get("taxon_id", "")
+        if cat:
+            basket_categories.add(cat)
+        if taxon:
+            basket_taxons.add(taxon)
+
+    result = []
+    for pid, score in candidates:
+        feat = store.product_features.get(pid, {})
+        cat = feat.get("product_category", "")
+        taxon = feat.get("taxon_id", "")
+
+        if penalize_same_category and cat and cat in basket_categories:
+            score = score * 0.6  # penalize duplicate category in basket
+        elif taxon and taxon not in basket_taxons:
+            score = score * 1.15  # cross-sell boost for different taxon
+        result.append((pid, score))
+
+    return sorted(result, key=lambda x: x[1], reverse=True)
+
+
+def _limit_check_filter(
+    candidates: list[tuple[str, float]],
+    user_price_tier_max: Optional[int],
+    demote_factor: float = 0.5,
+) -> list[tuple[str, float]]:
+    """
+    When a user checked their lease limit, demote products priced above their tier.
+    user_price_tier_max: max PRICE_RANGE_ORDINAL acceptable (0=budget, 1=mid, 2=high-end, 3=luxury)
+    """
+    if user_price_tier_max is None:
+        return candidates
+    result = []
+    for pid, score in candidates:
+        feat = store.product_features.get(pid, {})
+        tier = feat.get("price_range_ordinal", 1)
+        if tier > user_price_tier_max:
+            score = score * demote_factor
+        result.append((pid, score))
+    return sorted(result, key=lambda x: x[1], reverse=True)
+
+
+def _diversity_cap(
+    candidates: list[tuple[str, float]],
+    max_per_shop: int = 5,
+) -> list[tuple[str, float]]:
+    """Limit concentration from any single shop to avoid monopolising results."""
+    shop_counts: dict[str, int] = {}
+    result = []
+    for pid, score in candidates:
+        feat = store.product_features.get(pid, {})
+        shop = feat.get("shop_name", "")
+        count = shop_counts.get(shop, 0)
+        if shop and count >= max_per_shop:
+            continue
+        shop_counts[shop] = count + 1
+        result.append((pid, score))
+    return result
+
+
+def recommend(
+    account_id: str,
+    *,
+    context_taxon_id: Optional[str] = None,
+    top_n: Optional[int] = None,
+    exclude_product_ids: Optional[list[str]] = None,
+) -> dict:
+    """
+    Main recommendation entry point for a given account_id.
+
+    Steps:
+      1. Determine user's seed products (from interaction history)
+      2. Run CBF retrieval from seeds
+      3. Run popularity retrieval (taxon-scoped or global)
+      4. Merge via RRF
+      5. Apply context re-rankers (session, basket, limit, diversity)
+      6. Truncate to device-appropriate top-N
+      7. Return structured result dict
+    """
+    if not store.catalog_ready:
+        logger.warning("Catalog not ready — returning empty recommendations")
+        return _empty_result(account_id, "catalog_not_ready", context_taxon_id)
+
+    session = store.get_session(account_id)
+    device_type = session.get("device_type", "unknown")
+    taxon_path: list[str] = session.get("taxon_path", [])
+    basket: list[str] = session.get("basket", [])
+    intent_score: float = session.get("intent_score", 0.0)
+    limit_checked: bool = session.get("limit_checked", False)
+    effective_top_n = top_n or DEVICE_TOP_N.get(device_type, 15)
+
+    exclude = set(exclude_product_ids or [])
+
+    # ── Step 1: seed products ─────────────────────────────────────────────────
+    seed_products = store.get_user_top_products(account_id, top_n=10)
+    strategy = "popular"
+
+    # ── Step 2: CBF candidates ────────────────────────────────────────────────
+    cbf_candidates: list[tuple[str, float]] = []
+    if seed_products:
+        cbf_candidates = get_similar_products(
+            seed_products, top_k=60, exclude_ids=exclude
+        )
+        strategy = "cbf"
+
+    # If no CBF but we have a taxon context, use taxon-scoped content search
+    if not cbf_candidates and context_taxon_id:
+        cbf_candidates = get_taxon_products(
+            context_taxon_id, top_k=60, exclude_ids=exclude
+        )
+        strategy = "taxon_cbf"
+
+    # If we have both seed and session taxon, also pull from session taxon
+    if cbf_candidates and taxon_path:
+        active_taxon = taxon_path[-1]
+        if active_taxon != context_taxon_id:
+            session_taxon_candidates = get_taxon_products(
+                active_taxon, top_k=30, exclude_ids=exclude
+            )
+            cbf_candidates = _rrf_merge(
+                cbf_candidates, session_taxon_candidates, 0.7, 0.3
+            )
+
+    # ── Step 3: popularity candidates (fallback + enrichment) ─────────────────
+    taxon_for_popular = context_taxon_id or (taxon_path[-1] if taxon_path else None)
+    pop_products = store.get_popular_products(taxon_id=taxon_for_popular, top_n=60)
+    pop_candidates = [
+        (pid, score)
+        for pid, score in [
+            (pid, store._popularity.get(pid, 0.01)) for pid in pop_products
+        ]
+        if pid not in exclude
+    ]
+
+    if not cbf_candidates and not pop_candidates:
+        # Global popularity fallback
+        global_pop = store.get_popular_products(top_n=effective_top_n * 2)
+        pop_candidates = [
+            (pid, store._popularity.get(pid, 0.01))
+            for pid in global_pop
+            if pid not in exclude
+        ]
+        strategy = "popular"
+
+    # ── Step 4: Merge ─────────────────────────────────────────────────────────
+    if cbf_candidates and pop_candidates:
+        merged = _rrf_merge(cbf_candidates, pop_candidates, WEIGHT_CBF, WEIGHT_POPULAR)
+        if seed_products:
+            strategy = "hybrid"
+    elif cbf_candidates:
+        merged = cbf_candidates
+    else:
+        merged = pop_candidates
+
+    # ── Step 5: Context re-rankers ────────────────────────────────────────────
+    # 5a. Session taxon boost
+    merged = _session_taxon_boost(merged, taxon_path)
+
+    # 5b. Basket-aware
+    all_basket = list(set(basket + seed_products[:3]))
+    if all_basket:
+        merged = _basket_aware_rerank(merged, all_basket)
+
+    # 5c. Limit-check price filter
+    if limit_checked:
+        # User checked limit → prefer budget/mid tier
+        merged = _limit_check_filter(merged, user_price_tier_max=1)
+
+    # 5d. Intent-level adjustment
+    if intent_score >= HIGH_INTENT_THRESHOLD:
+        # High intent: keep order as-is (conversion-optimised by scores)
+        pass
+    elif intent_score <= LOW_INTENT_THRESHOLD:
+        # Low intent: inject more taxon diversity at the end
+        if context_taxon_id:
+            extra = get_taxon_products(context_taxon_id, top_k=10, exclude_ids=exclude)
+            extra_pids = {pid for pid, _ in merged[:effective_top_n]}
+            for pid, s in extra:
+                if pid not in extra_pids:
+                    merged.append((pid, s * 0.5))
+
+    # 5e. Shop diversity cap
+    merged = _diversity_cap(merged)
+
+    # ── Step 6: Final top-N ───────────────────────────────────────────────────
+    final_ids = [pid for pid, _ in merged[: effective_top_n * 2]]
+    final_ids = final_ids[:effective_top_n]
+
+    # Resolve taxon_id for response (context > session last > user preferred)
+    response_taxon = (
+        context_taxon_id
+        or (taxon_path[-1] if taxon_path else None)
+        or (store.get_user_interacted_taxons(account_id, top_n=1) or [None])[0]
+    )
+
+    return {
+        "id": account_id,
+        "taxon_id": response_taxon,
+        "recommendations": final_ids,
+        "strategy": strategy,
+        "intent_score": round(intent_score, 2),
+        "device": device_type,
+        "count": len(final_ids),
+    }
+
+
+def _empty_result(account_id: str, reason: str, taxon_id: Optional[str] = None) -> dict:
+    return {
+        "id": account_id,
+        "taxon_id": taxon_id,
+        "recommendations": [],
+        "strategy": reason,
+        "intent_score": 0.0,
+        "device": "unknown",
+        "count": 0,
+    }
