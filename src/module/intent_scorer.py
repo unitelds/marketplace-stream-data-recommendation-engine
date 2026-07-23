@@ -46,6 +46,8 @@ INTENT_WEIGHTS: dict[str, dict[str, float]] = {
         "default": 2.5,
     },
     "view_product": {"default": 1.0},
+    # product_click from consumer_events: explicit product card click (more intent than passive view)
+    "product_click": {"default": 1.5},
     "taxon_click": {"default": 0.5},
 }
 

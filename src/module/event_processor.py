@@ -256,7 +256,60 @@ def normalize_event(
     }
 
 
-# ─── consumer_events normalization (taxon_click) ─────────────────────────────
+# ─── consumer_events normalization (taxon_click + product_click) ─────────────
+
+
+def extract_product_ids_and_taxon(event_value: Any) -> tuple[list[str], Optional[str]]:
+    """
+    Parse product_click EVENTVALUE:
+      {'productIds': ['pid1', 'pid2'], 'taxon': {'label': 'Mongolian'}}
+
+    Returns (product_ids, taxon_label).
+    """
+    parsed = safe_parse(event_value)
+    product_ids: list[str] = []
+    taxon_label: Optional[str] = None
+
+    if isinstance(parsed, dict):
+        # productIds field (various key names)
+        raw_pids = (
+            parsed.get("productIds")
+            or parsed.get("productId")
+            or parsed.get("product_ids")
+            or parsed.get("product_id")
+        )
+        if isinstance(raw_pids, list):
+            product_ids = [str(p).strip() for p in raw_pids if p]
+        elif raw_pids:
+            product_ids = [str(raw_pids).strip()]
+
+        taxon = parsed.get("taxon", {})
+        if isinstance(taxon, dict):
+            taxon_label = (
+                taxon.get("label")
+                or taxon.get("id")
+                or taxon.get("taxon_id")
+                or taxon.get("slug")
+            )
+        elif isinstance(taxon, str):
+            taxon_label = taxon
+
+    return product_ids, taxon_label
+
+
+def _resolve_taxon_label(
+    label: Optional[str], taxon_label_map: dict[str, str]
+) -> Optional[str]:
+    """Resolve a raw taxon label (Mongolian or slug) → taxon_id."""
+    if not label:
+        return None
+    taxon_id = taxon_label_map.get(label)
+    if not taxon_id:
+        slug = re.sub(r"[\s_]+", "-", label.lower())
+        taxon_id = taxon_label_map.get(slug)
+    return taxon_id
+
+
 def normalize_consumer_event(
     event_name: str,
     event_value_raw: Any,
@@ -265,42 +318,69 @@ def normalize_consumer_event(
     user_agent: Optional[str],
     taxon_label_map: dict[str, str],
     event_timestamp: Optional[datetime] = None,
-) -> Optional[dict]:
+) -> list[dict]:
     """
-    Normalize a consumer_events row.
+    Normalize consumer_events rows into a list of standard event dicts.
 
-    Only taxon_click is currently used; others return None.
-    Resolves Mongolian display labels → taxon_id via the catalog map.
+    Handles:
+      taxon_click  → 1 event with taxon_id (no product)
+      product_click → N events, one per product in productIds[], with taxon_id
+
+    Returns empty list for unrecognised or unparseable events.
     """
-    if event_name != "taxon_click":
-        return None
+    device = detect_device_type(user_agent)
 
-    label = extract_taxon_label(event_value_raw)
-    if not label:
-        return None
+    if event_name == "taxon_click":
+        label = extract_taxon_label(event_value_raw)
+        if not label:
+            return []
+        taxon_id = _resolve_taxon_label(label, taxon_label_map)
+        return [
+            {
+                "event_id": None,
+                "activity_name": "taxon_click",
+                "account_id": account_id,
+                "product_id": None,
+                "taxon_id": taxon_id,
+                "taxon_label_raw": label,
+                "session_id": session_id,
+                "user_agent": user_agent,
+                "device_type": device,
+                "intent_weight": get_intent_weight("taxon_click"),
+                "is_basket_add": False,
+                "is_basket_remove": False,
+                "is_limit_check": False,
+                "timestamp": event_timestamp,
+            }
+        ]
 
-    # Resolution order: exact → slug-normalized → unresolved (keep label for logging)
-    taxon_id = taxon_label_map.get(label)
-    if not taxon_id:
-        slug = re.sub(r"[\s_]+", "-", label.lower())
-        taxon_id = taxon_label_map.get(slug)
+    if event_name == "product_click":
+        product_ids, taxon_label = extract_product_ids_and_taxon(event_value_raw)
+        if not product_ids:
+            return []
+        taxon_id = _resolve_taxon_label(taxon_label, taxon_label_map)
+        weight = get_intent_weight("product_click")
+        return [
+            {
+                "event_id": None,
+                "activity_name": "product_click",
+                "account_id": account_id,
+                "product_id": pid,
+                "taxon_id": taxon_id,
+                "taxon_label_raw": taxon_label,
+                "session_id": session_id,
+                "user_agent": user_agent,
+                "device_type": device,
+                "intent_weight": weight,
+                "is_basket_add": False,
+                "is_basket_remove": False,
+                "is_limit_check": False,
+                "timestamp": event_timestamp,
+            }
+            for pid in product_ids
+        ]
 
-    return {
-        "event_id": None,
-        "activity_name": "taxon_click",
-        "account_id": account_id,
-        "product_id": None,
-        "taxon_id": taxon_id,
-        "taxon_label_raw": label,
-        "session_id": session_id,
-        "user_agent": user_agent,
-        "device_type": detect_device_type(user_agent),
-        "intent_weight": get_intent_weight("taxon_click"),
-        "is_basket_add": False,
-        "is_basket_remove": False,
-        "is_limit_check": False,
-        "timestamp": event_timestamp,
-    }
+    return []  # Unrecognised consumer event type
 
 
 def detect_device_type(user_agent: Optional[str]) -> str:

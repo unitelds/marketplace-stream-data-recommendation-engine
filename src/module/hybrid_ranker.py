@@ -307,3 +307,117 @@ def _empty_result(account_id: str, reason: str, taxon_id: Optional[str] = None) 
         "device": "unknown",
         "count": 0,
     }
+
+
+def recommend_multi_taxon(
+    account_id: str,
+    *,
+    top_taxons: int = 3,
+    top_n_per_taxon: int = 10,
+    extra_taxon_ids: Optional[list[str]] = None,
+    exclude_product_ids: Optional[list[str]] = None,
+) -> dict:
+    """
+    Generate per-taxon recommendations for a user.
+
+    Taxon selection order:
+      1. Current session taxon path (most recent, highest recency signal)
+      2. User's interaction-weighted historical taxons
+      3. Any extra taxon_ids passed by caller (e.g. from context)
+
+    Cross-taxon deduplication: once a product appears in an earlier taxon's list
+    it is excluded from later ones, ensuring unique products across all feeds.
+
+    Returns:
+      {
+        "id": account_id,
+        "taxon_feeds": [
+          {
+            "taxon_id": "...",
+            "taxon_name": "...",
+            "recommendations": ["pid", ...],
+            "score": 8.5
+          }, ...
+        ],
+        "total_products": N,
+        "strategy": "multi_taxon_hybrid",
+        "intent_score": 8.5,
+        "device": "mobile"
+      }
+    """
+    if not store.catalog_ready:
+        return {
+            "id": account_id,
+            "taxon_feeds": [],
+            "total_products": 0,
+            "strategy": "catalog_not_ready",
+            "intent_score": 0.0,
+            "device": "unknown",
+        }
+
+    session = store.get_session(account_id)
+    device_type = session.get("device_type", "unknown")
+    session_taxons: list[str] = session.get("taxon_path", [])
+    intent_score: float = session.get("intent_score", 0.0)
+
+    # Build ordered candidate taxon list (deduplicated)
+    seen_taxons: set[str] = set()
+    ordered_taxons: list[str] = []
+
+    def _add(tid: str) -> None:
+        if tid and tid not in seen_taxons and tid in store.taxon_id_to_products:
+            seen_taxons.add(tid)
+            ordered_taxons.append(tid)
+
+    # 1. Session path (most recent first — reversed)
+    for t in reversed(session_taxons[-5:]):
+        _add(t)
+
+    # 2. Historical preference (interaction-weighted)
+    for t in store.get_user_interacted_taxons(account_id, top_n=top_taxons + 3):
+        _add(t)
+
+    # 3. Caller-supplied extras
+    for t in extra_taxon_ids or []:
+        _add(t)
+
+    # Trim to requested limit
+    selected_taxons = ordered_taxons[:top_taxons]
+
+    # If user has no history, fall back to global popular taxons
+    if not selected_taxons:
+        selected_taxons = list(store.taxon_id_to_products.keys())[:top_taxons]
+
+    # Generate per-taxon recommendations with cross-taxon deduplication
+    used_products: set[str] = set(exclude_product_ids or [])
+    taxon_feeds: list[dict] = []
+
+    for taxon_id in selected_taxons:
+        result = recommend(
+            account_id,
+            context_taxon_id=taxon_id,
+            top_n=top_n_per_taxon,
+            exclude_product_ids=list(used_products),
+        )
+        recs = result.get("recommendations", [])
+        if not recs:
+            continue
+        used_products.update(recs)
+        taxon_feeds.append(
+            {
+                "taxon_id": taxon_id,
+                "taxon_name": store.taxon_id_to_name.get(taxon_id, ""),
+                "recommendations": recs,
+                "count": len(recs),
+                "score": result.get("intent_score", 0.0),
+            }
+        )
+
+    return {
+        "id": account_id,
+        "taxon_feeds": taxon_feeds,
+        "total_products": len(used_products - set(exclude_product_ids or [])),
+        "strategy": "multi_taxon_hybrid" if taxon_feeds else "popular",
+        "intent_score": round(intent_score, 2),
+        "device": device_type,
+    }

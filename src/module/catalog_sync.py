@@ -291,6 +291,7 @@ async def sync_catalog(force: bool = False) -> bool:
         store.tfidf_matrix = matrix
         store.taxon_label_map = label_map
         store.taxon_name_to_id = name_to_id
+        store.taxon_id_to_name = {v: k for k, v in name_to_id.items()}  # reverse map
         store.taxon_id_to_products = id_to_products
         store.catalog_size = len(product_ids)
         store.catalog_synced_at = time.time()

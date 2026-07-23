@@ -48,6 +48,8 @@ class FeatureStore:
         self.taxon_label_map: dict[str, str] = {}
         # taxon slug → taxon_id
         self.taxon_name_to_id: dict[str, str] = {}
+        # taxon_id → taxon slug (reverse map for response labelling)
+        self.taxon_id_to_name: dict[str, str] = {}
         # taxon_id → list of product_ids
         self.taxon_id_to_products: dict[str, list[str]] = defaultdict(list)
 
@@ -204,6 +206,7 @@ class FeatureStore:
             "popularity_entries": len(self._popularity),
             "taxon_label_map_size": len(self.taxon_label_map),
             "taxon_name_map_size": len(self.taxon_name_to_id),
+            "taxon_id_to_name_size": len(self.taxon_id_to_name),
             "taxons_with_products": len(self.taxon_id_to_products),
         }
 
