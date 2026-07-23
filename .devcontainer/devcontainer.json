@@ -5,7 +5,11 @@
 	// Set CPU & memory limit to prevent the server from going down.
 	"runArgs": [
 		"--cpus=16",
-		"--memory=32g"
+		"--memory=32g",
+		"-p",
+		"8018:8018",
+		"-p",
+		"8019:8019"
 	],
 	"build": {
 		"context": "..",
@@ -69,7 +73,11 @@
 		}
 	},
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	// "forwardPorts": [],
+	"forwardPorts": [
+		8018,
+		8019
+	],
+	// Auto-start the recommendation API when the container starts.
 	// Use 'postCreateCommand' to run commands after the container is created.
 	"postCreateCommand": "umask 0002 && conda env update -n base -f environment.yml",
 	// "postCreateCommand": "pip3 --disable-pip-version-check --no-cache-dir install -r requirements.txt",
