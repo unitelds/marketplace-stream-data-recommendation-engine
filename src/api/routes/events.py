@@ -41,6 +41,7 @@ from src.module.event_processor import (
 )
 from src.module.feature_store import store
 from src.module.hybrid_ranker import recommend, recommend_multi_taxon
+from src.module.user_history_loader import ensure_user_history, is_loaded
 
 router = APIRouter(prefix="/api/v1", tags=["recommendations"])
 
@@ -48,6 +49,7 @@ router = APIRouter(prefix="/api/v1", tags=["recommendations"])
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
 
 async def _apply_event(norm: dict) -> None:
     """Persist one normalized event into the in-memory feature store."""
@@ -132,7 +134,9 @@ def _ensure_delivery_table() -> bool:
         return True
     try:
         from sqlalchemy import create_engine, text
+
         from config import WRITE_DATABASE_URL
+
         engine = create_engine(WRITE_DATABASE_URL, connect_args={"connect_timeout": 5})
         with engine.begin() as conn:
             conn.execute(text("""
@@ -158,16 +162,30 @@ def _log_delivered(account_id: str, product_ids: list[str], strategy: str) -> No
     try:
         import pandas as pd
         from sqlalchemy import create_engine
+
         from config import WRITE_DATABASE_URL
+
         now = datetime.now(timezone.utc).isoformat()
-        df = pd.DataFrame([
-            {"account_id": account_id, "product_id": pid, "strategy": strategy, "served_at": now}
-            for pid in product_ids
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "account_id": account_id,
+                    "product_id": pid,
+                    "strategy": strategy,
+                    "served_at": now,
+                }
+                for pid in product_ids
+            ]
+        )
         engine = create_engine(WRITE_DATABASE_URL, connect_args={"connect_timeout": 5})
         with engine.begin() as conn:
-            df.to_sql("rec_engine_delivery_log", con=conn,
-                      if_exists="append", index=False, chunksize=200)
+            df.to_sql(
+                "rec_engine_delivery_log",
+                con=conn,
+                if_exists="append",
+                index=False,
+                chunksize=200,
+            )
         engine.dispose()
         logger.debug(f"Logged {len(product_ids)} recs for {account_id}")
     except Exception as exc:
@@ -177,6 +195,7 @@ def _log_delivered(account_id: str, product_ids: list[str], strategy: str) -> No
 # ---------------------------------------------------------------------------
 # POST /api/v1/events
 # ---------------------------------------------------------------------------
+
 
 @router.post(
     "/events",
@@ -218,15 +237,23 @@ async def ingest_events(
         recommendations.append(RecommendationResult(**result))
         if result["recommendations"]:
             background_tasks.add_task(
-                _log_delivered, account_id, result["recommendations"], result["strategy"]
+                _log_delivered,
+                account_id,
+                result["recommendations"],
+                result["strategy"],
             )
-    return EventsResponse(status="accepted", processed=processed,
-                          failed=failed, recommendations=recommendations)
+    return EventsResponse(
+        status="accepted",
+        processed=processed,
+        failed=failed,
+        recommendations=recommendations,
+    )
 
 
 # ---------------------------------------------------------------------------
 # POST /api/v1/consumer-events
 # ---------------------------------------------------------------------------
+
 
 @router.post(
     "/consumer-events",
@@ -269,15 +296,23 @@ async def ingest_consumer_events(
         recommendations.append(RecommendationResult(**result))
         if result["recommendations"]:
             background_tasks.add_task(
-                _log_delivered, account_id, result["recommendations"], result["strategy"]
+                _log_delivered,
+                account_id,
+                result["recommendations"],
+                result["strategy"],
             )
-    return EventsResponse(status="accepted", processed=processed,
-                          failed=failed, recommendations=recommendations)
+    return EventsResponse(
+        status="accepted",
+        processed=processed,
+        failed=failed,
+        recommendations=recommendations,
+    )
 
 
 # ---------------------------------------------------------------------------
 # POST /api/v1/infer
 # ---------------------------------------------------------------------------
+
 
 @router.post(
     "/infer",
@@ -290,10 +325,17 @@ async def infer(
     background_tasks: BackgroundTasks,
 ) -> InferResponse:
     ctx = req.context
-    if ctx.cart_product_ids or ctx.device_type or ctx.current_taxon_id or ctx.limit_checked:
+    if (
+        ctx.cart_product_ids
+        or ctx.device_type
+        or ctx.current_taxon_id
+        or ctx.limit_checked
+    ):
         for pid in ctx.cart_product_ids:
             await store.update_session(
-                req.account_id, product_id=pid, basket_add=pid,
+                req.account_id,
+                product_id=pid,
+                basket_add=pid,
                 limit_checked=ctx.limit_checked,
                 device_type=ctx.device_type,
                 taxon_id=ctx.current_taxon_id,
@@ -306,8 +348,10 @@ async def infer(
     )
     if result["recommendations"]:
         background_tasks.add_task(
-            _log_delivered, req.account_id,
-            result["recommendations"], result["strategy"]
+            _log_delivered,
+            req.account_id,
+            result["recommendations"],
+            result["strategy"],
         )
     return InferResponse(**result)
 
@@ -316,21 +360,32 @@ async def infer(
 # POST /api/v1/feed
 # ---------------------------------------------------------------------------
 
+
 @router.post(
     "/feed",
     response_model=MultiTaxonResponse,
     status_code=status.HTTP_200_OK,
     summary="Multi-taxon recommendation feed",
     description=(
-        "Returns recommendations organized by the user's top taxons "
-        "based on interaction-weighted history and current session browse path. "
-        "Products are cross-taxon deduplicated."
+        "Returns per-taxon recommendations for a user. On first request for a "
+        "user with no in-memory history, Oracle consumer_events is queried in "
+        "real-time (up to 3 s) to load their engagement profile before ranking. "
+        "After generating the feed, recommendations are pushed to the shop's "
+        "configured feed endpoint in the background."
     ),
 )
 async def feed(
     req: FeedRequest,
     background_tasks: BackgroundTasks,
 ) -> MultiTaxonResponse:
+    # Trigger Oracle history load in background (non-blocking).
+    # First call returns hash-diversified cold-start results (<100ms).
+    # Subsequent calls will be fully personalized once Oracle load completes.
+    if not is_loaded(req.account_id) and not store.get_user_top_products(
+        req.account_id, top_n=1
+    ):
+        background_tasks.add_task(_bg_load_oracle, req.account_id)
+
     result = recommend_multi_taxon(
         req.account_id,
         top_taxons=req.top_taxons,
@@ -338,12 +393,22 @@ async def feed(
         extra_taxon_ids=req.extra_taxon_ids or [],
         exclude_product_ids=req.exclude_product_ids or [],
     )
-    all_pids = [pid for tf in result.get("taxon_feeds", []) for pid in tf.get("recommendations", [])]
+    all_pids = [
+        pid
+        for tf in result.get("taxon_feeds", [])
+        for pid in tf.get("recommendations", [])
+    ]
     if all_pids:
         background_tasks.add_task(
             _log_delivered, req.account_id, all_pids, result.get("strategy", "feed")
         )
+
     taxon_feeds = [TaxonFeedItem(**tf) for tf in result.get("taxon_feeds", [])]
+
+    # Auto-push to shop feed endpoint in background (fire-and-forget)
+    if taxon_feeds:
+        background_tasks.add_task(_auto_push_feed, req.account_id, taxon_feeds)
+
     return MultiTaxonResponse(
         id=result["id"],
         taxon_feeds=taxon_feeds,
@@ -358,21 +423,74 @@ async def feed(
 # POST /api/v1/feed/push
 # ---------------------------------------------------------------------------
 
+
+def _bg_load_oracle(account_id: str) -> None:
+    """
+    Background task: load Oracle engagement history for a user.
+
+    Runs in FastAPI's thread pool so it never blocks the event loop.
+    Subsequent /feed requests after this completes will use real Oracle data.
+    """
+    import asyncio as _asyncio
+
+    loop = _asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(ensure_user_history(account_id, timeout=20.0))
+    finally:
+        loop.close()
+
+
+def _auto_push_feed(account_id: str, taxon_feeds: list[TaxonFeedItem]) -> None:
+    """Background task: push feed to shop's configured API endpoint."""
+    try:
+        from config import MARKETPLACE_API_BASE_URL, MARKETPLACE_API_TIMEOUT
+
+        push_url = f"{MARKETPLACE_API_BASE_URL}/{account_id}"
+        payload = {
+            "id": account_id,
+            "taxon_feeds": [
+                {
+                    "taxon_id": tf.taxon_id,
+                    "taxon_name": tf.taxon_name,
+                    "recommendations": tf.recommendations,
+                }
+                for tf in taxon_feeds
+            ],
+        }
+        import httpx as _httpx
+
+        with _httpx.Client(timeout=MARKETPLACE_API_TIMEOUT) as client:
+            resp = client.post(push_url, json=payload)
+            resp.raise_for_status()
+        total = sum(len(tf.recommendations) for tf in taxon_feeds)
+        logger.info(
+            f"Feed auto-pushed to {push_url}: {total} products [{resp.status_code}]"
+        )
+    except Exception as exc:
+        logger.debug(f"Feed auto-push failed (non-critical): {exc}")
+
+
 @router.post(
     "/feed/push",
     response_model=FeedPushResponse,
     status_code=status.HTTP_200_OK,
     summary="Generate feed and push to shop API",
     description=(
-        "Generates multi-taxon recommendations and POSTs them to the "
-        "shop's configured feed endpoint. The response always contains "
-        "recommendations regardless of push success/failure."
+        "Generates multi-taxon recommendations (loading Oracle history if needed) "
+        "and synchronously POSTs them to the shop's configured feed endpoint. "
+        "The response always contains recommendations regardless of push outcome."
     ),
 )
 async def feed_push(
     req: FeedPushRequest,
     background_tasks: BackgroundTasks,
 ) -> FeedPushResponse:
+    # Trigger Oracle history load in background (non-blocking)
+    if not is_loaded(req.account_id) and not store.get_user_top_products(
+        req.account_id, top_n=1
+    ):
+        background_tasks.add_task(_bg_load_oracle, req.account_id)
+
     result = recommend_multi_taxon(
         req.account_id,
         top_taxons=req.top_taxons,
@@ -391,6 +509,7 @@ async def feed_push(
     if not push_url:
         try:
             from config import MARKETPLACE_API_BASE_URL
+
             push_url = f"{MARKETPLACE_API_BASE_URL}/{req.account_id}"
         except ImportError:
             push_url = None
@@ -401,8 +520,11 @@ async def feed_push(
         push_payload = {
             "id": req.account_id,
             "taxon_feeds": [
-                {"taxon_id": tf.taxon_id, "taxon_name": tf.taxon_name,
-                 "recommendations": tf.recommendations}
+                {
+                    "taxon_id": tf.taxon_id,
+                    "taxon_name": tf.taxon_name,
+                    "recommendations": tf.recommendations,
+                }
                 for tf in taxon_feeds
             ],
         }

@@ -87,6 +87,23 @@ def get_similar_products(
     return results
 
 
+def _catalog_quality_score(product_id: str) -> float:
+    """
+    Baseline quality score from catalog metadata.
+
+    Used when interaction-based popularity is zero (cold-start).
+    Combines premium grade, price tier, and stock level so that
+    better-quality in-stock products rank above unknown ones.
+    """
+    feat = store.product_features.get(product_id, {})
+    premium = feat.get("premium_grade_ordinal", 0)  # 0-3
+    price = feat.get("price_range_ordinal", 1)  # 0-3
+    stock = min(feat.get("stock", 0), 10)  # cap at 10
+    has_image = 1.0 if feat.get("url_link") else 0.0
+    # Normalised to 0–1 range
+    return (premium * 0.4 + price * 0.2 + stock * 0.3 + has_image * 0.1) / 3.0
+
+
 def get_taxon_products(
     taxon_id: str,
     top_k: int = 50,
@@ -94,9 +111,8 @@ def get_taxon_products(
     require_in_stock: bool = True,
 ) -> list[tuple[str, float]]:
     """
-    Return products in a given taxon, optionally scoring by popularity.
-
-    Used for cold-start when user clicked a taxon but has no product history.
+    Return products in a given taxon ranked by interaction popularity
+    (or catalog quality score for cold-start when popularity is zero).
     """
     if not store.catalog_ready:
         return []
@@ -112,7 +128,9 @@ def get_taxon_products(
             feat = store.product_features.get(pid, {})
             if feat.get("stock", 0) <= 0:
                 continue
-        score = store._popularity.get(pid, 0.0)
+        # Use interaction score if available, otherwise catalog quality as baseline
+        pop = store._popularity.get(pid, 0.0)
+        score = pop if pop > 0 else _catalog_quality_score(pid)
         results.append((pid, score))
         if len(results) >= top_k:
             break

@@ -14,6 +14,7 @@ Re-ranking pipeline (applied in order):
 
 from __future__ import annotations
 
+import hashlib
 from typing import Optional
 
 from loguru import logger
@@ -365,7 +366,14 @@ def recommend_multi_taxon(
     ordered_taxons: list[str] = []
 
     def _add(tid: str) -> None:
-        if tid and tid not in seen_taxons and tid in store.taxon_id_to_products:
+        import re as _re
+
+        if (
+            tid
+            and tid not in seen_taxons
+            and tid in store.taxon_id_to_products
+            and _re.match(r"^[0-9a-fA-F]{24}$", tid)
+        ):
             seen_taxons.add(tid)
             ordered_taxons.append(tid)
 
@@ -384,9 +392,24 @@ def recommend_multi_taxon(
     # Trim to requested limit
     selected_taxons = ordered_taxons[:top_taxons]
 
-    # If user has no history, fall back to global popular taxons
+    # Cold-start: user has no history — use hash-based taxon rotation so every
+    # user gets a different starting position in the catalog taxon list.
+    # This guarantees diverse results across users even with zero interaction data.
     if not selected_taxons:
-        selected_taxons = list(store.taxon_id_to_products.keys())[:top_taxons]
+        import re as _re
+
+        _OID = _re.compile(r"^[0-9a-fA-F]{24}$")
+        all_taxon_ids = [
+            t
+            for t in store.taxon_id_to_products
+            if store.taxon_id_to_products[t] and _OID.match(t)
+        ]
+        if all_taxon_ids:
+            # Deterministic but user-unique: MD5 of account_id → offset into taxon list
+            h = int(hashlib.md5(account_id.encode()).hexdigest()[:8], 16)
+            offset = h % len(all_taxon_ids)
+            rotated = all_taxon_ids[offset:] + all_taxon_ids[:offset]
+            selected_taxons = rotated[:top_taxons]
 
     # Generate per-taxon recommendations with cross-taxon deduplication
     used_products: set[str] = set(exclude_product_ids or [])
