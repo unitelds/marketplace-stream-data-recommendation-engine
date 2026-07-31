@@ -225,9 +225,40 @@ HANDSET_FEED_CACHE_TTL = 3600  # 1 hour
 # APPLICATION METADATA
 # ─────────────────────────────────────────────────────────
 APP_TITLE = "TOKI Marketplace Recommendation System v2"
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.2.0"
 APP_DESCRIPTION = (
     "Enhanced recommendation system with intelligent caching, "
     "dynamic feeds, prebuilt handset feed integration, expanded taxonomy, "
-    "error analysis, and delivery tracking."
+    "error analysis, delivery tracking, and API key authentication."
 )
+
+# ─────────────────────────────────────────────────────────
+# SECURITY — API key authentication
+# ─────────────────────────────────────────────────────────
+# Format: "key1:tier1,key2:tier2"   tiers: internal | standard | readonly
+# Override at deploy time — never commit real keys to source control.
+# The middleware reads this at import time from the environment.
+# Example:
+#   TOKI_API_KEYS="abc123:internal,xyz789:standard,mon456:readonly"
+API_KEYS_ENV_VAR = "TOKI_API_KEYS"
+
+# ─────────────────────────────────────────────────────────
+# PERFORMANCE TUNING — 40 GB RAM / 32 CPU server
+# ─────────────────────────────────────────────────────────
+# Worker sizing: 2 × CPU + 1 is the classic rule; we cap at 28 to leave
+# headroom for the OS and background catalog-sync threads.
+# Each UvicornWorker is async — 1000 concurrent users ÷ 24 workers ≈ 42
+# in-flight coroutines per worker, well within asyncio capacity.
+PEAK_CONCURRENT_USERS = int(os.getenv("TOKI_PEAK_USERS", 1000))
+
+# Feature store keeps all product vectors in RAM.
+# 4511 products × 30000 TF-IDF float32 features ≈ 540 MB sparse (actual: ~8 MB
+# after scipy sparse compression).  User-item matrix grows with traffic;
+# 1000 users × 500 products × 8 bytes ≈ 4 MB. Well within 40 GB budget.
+FEATURE_STORE_MAX_USERS = int(os.getenv("TOKI_FS_MAX_USERS", 500_000))
+FEATURE_STORE_MAX_PRODUCTS_PER_USER = int(os.getenv("TOKI_FS_MAX_PROD_PER_USER", 1000))
+
+# DB pool: 24 workers × max 15 connections = 360 connections << PG limit 2000
+# Each catalog sync needs 1 connection; recommendation endpoints are in-memory.
+DB_POOL_SIZE = int(os.getenv("TOKI_DB_POOL_SIZE", 8))  # raised from 5
+DB_MAX_OVERFLOW = int(os.getenv("TOKI_DB_MAX_OVERFLOW", 12))  # raised from 10

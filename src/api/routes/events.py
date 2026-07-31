@@ -122,74 +122,105 @@ def _normalize_consumer_row(row: ConsumerEventRow) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Delivery log
+# Delivery log — async queue writer (avoids thread-pool saturation)
 # ---------------------------------------------------------------------------
+# All recommendation handlers enqueue records here; a single background
+# asyncio task drains the queue in batches.  This decouples DB writes from
+# the request hot path and eliminates p95 latency spikes caused by per-request
+# SQLAlchemy engine creation inside BackgroundTasks thread workers.
 
+import asyncio as _asyncio
+from collections import deque as _deque
+
+_DELIVERY_QUEUE: _deque[dict] = _deque(maxlen=50_000)  # ~50k records in-RAM buffer
 _DELIVERY_TABLE_READY = False
+_DELIVERY_WRITER_RUNNING = False
+_DELIVERY_BATCH_SIZE = 200
+_DELIVERY_FLUSH_INTERVAL = 5.0  # seconds between flushes
 
 
-def _ensure_delivery_table() -> bool:
+def _enqueue_delivery(account_id: str, product_ids: list[str], strategy: str) -> None:
+    """Non-blocking: append delivery records to in-memory queue."""
+    now = datetime.now(timezone.utc).isoformat()
+    for pid in product_ids:
+        _DELIVERY_QUEUE.append(
+            {
+                "account_id": account_id,
+                "product_id": pid,
+                "strategy": strategy,
+                "served_at": now,
+            }
+        )
+
+
+# Keep the synchronous version as a fallback for external callers
+def _log_delivered(account_id: str, product_ids: list[str], strategy: str) -> None:
+    """BackgroundTask shim — just enqueues; the async writer handles the DB write."""
+    _enqueue_delivery(account_id, product_ids, strategy)
+
+
+async def _delivery_writer_loop() -> None:
+    """Single coroutine that flushes _DELIVERY_QUEUE to PostgreSQL in batches."""
     global _DELIVERY_TABLE_READY
-    if _DELIVERY_TABLE_READY:
-        return True
+    import asyncio
+
+    while True:
+        await asyncio.sleep(_DELIVERY_FLUSH_INTERVAL)
+        if not _DELIVERY_QUEUE:
+            continue
+        # Drain up to _DELIVERY_BATCH_SIZE records
+        batch: list[dict] = []
+        while _DELIVERY_QUEUE and len(batch) < _DELIVERY_BATCH_SIZE:
+            batch.append(_DELIVERY_QUEUE.popleft())
+        if not batch:
+            continue
+        # Run blocking DB write in executor so we don't block the event loop
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, _flush_batch_to_db, batch
+            )
+        except Exception as exc:
+            logger.debug(f"Delivery flush failed (non-critical): {exc}")
+
+
+def _flush_batch_to_db(batch: list[dict]) -> None:
+    """Synchronous batch write — called in a thread-pool executor."""
+    global _DELIVERY_TABLE_READY
     try:
+        import pandas as pd
         from sqlalchemy import create_engine, text
 
         from config import WRITE_DATABASE_URL
 
-        engine = create_engine(WRITE_DATABASE_URL, connect_args={"connect_timeout": 5})
-        with engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS rec_engine_delivery_log (
-                    id         BIGSERIAL PRIMARY KEY,
-                    account_id TEXT NOT NULL,
-                    product_id TEXT NOT NULL,
-                    strategy   TEXT,
-                    served_at  TIMESTAMPTZ DEFAULT now()
-                )
-            """))
-        engine.dispose()
-        _DELIVERY_TABLE_READY = True
-        return True
-    except Exception as exc:
-        logger.debug(f"Delivery table create failed (non-critical): {exc}")
-        return False
-
-
-def _log_delivered(account_id: str, product_ids: list[str], strategy: str) -> None:
-    if not product_ids or not _ensure_delivery_table():
-        return
-    try:
-        import pandas as pd
-        from sqlalchemy import create_engine
-
-        from config import WRITE_DATABASE_URL
-
-        now = datetime.now(timezone.utc).isoformat()
-        df = pd.DataFrame(
-            [
-                {
-                    "account_id": account_id,
-                    "product_id": pid,
-                    "strategy": strategy,
-                    "served_at": now,
-                }
-                for pid in product_ids
-            ]
+        engine = create_engine(
+            WRITE_DATABASE_URL,
+            pool_size=1,
+            max_overflow=0,
+            connect_args={"connect_timeout": 5},
         )
-        engine = create_engine(WRITE_DATABASE_URL, connect_args={"connect_timeout": 5})
         with engine.begin() as conn:
-            df.to_sql(
+            if not _DELIVERY_TABLE_READY:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS rec_engine_delivery_log (
+                        id         BIGSERIAL PRIMARY KEY,
+                        account_id TEXT NOT NULL,
+                        product_id TEXT NOT NULL,
+                        strategy   TEXT,
+                        served_at  TIMESTAMPTZ DEFAULT now()
+                    )
+                """))
+                _DELIVERY_TABLE_READY = True
+            pd.DataFrame(batch).to_sql(
                 "rec_engine_delivery_log",
                 con=conn,
                 if_exists="append",
                 index=False,
-                chunksize=200,
+                chunksize=500,
             )
         engine.dispose()
-        logger.debug(f"Logged {len(product_ids)} recs for {account_id}")
+        logger.debug(f"Delivery log: flushed {len(batch)} records")
     except Exception as exc:
-        logger.debug(f"Log delivered recs failed (non-critical): {exc}")
+        logger.debug(f"Delivery flush DB error (non-critical): {exc}")
 
 
 # ---------------------------------------------------------------------------

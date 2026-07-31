@@ -1,8 +1,8 @@
 # TOKI Marketplace Stream-Data Recommendation Engine
 
-Real-time recommendation engine for the TOKI marketplace. Ingests engagement events from shop data streams, builds per-user intent profiles, and serves hybrid content-based + popularity recommendations across multiple product taxons.
+Real-time recommendation engine for the TOKI marketplace. Ingests engagement events from shop data streams, builds per-user intent profiles, and serves hybrid content-based + collaborative filtering + popularity recommendations across multiple product taxons and three distinct UI placement areas.
 
-**Current version:** `4.1.0` | **Environment:** `production` | **Port:** `8018`
+**Current version:** `4.2.0` | **Environment:** `production` | **Port:** `8018`
 
 ---
 
@@ -11,7 +11,8 @@ Real-time recommendation engine for the TOKI marketplace. Ingests engagement eve
 - [Architecture](#architecture)
 - [Data Sources](#data-sources)
 - [Engagement Signal Taxonomy](#engagement-signal-taxonomy)
-- [Recommendation Pipeline](#recommendation-pipeline)
+- [Recommendation Pipelines](#recommendation-pipelines)
+- [UI Placement Areas](#ui-placement-areas)
 - [API Reference](#api-reference)
 - [Project Structure](#project-structure)
 - [Configuration](#configuration)
@@ -53,19 +54,28 @@ Shop Data Stream
 │                          │                                   │
 │  Catalog (PostgreSQL, synced every 10 min)                   │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │ 4,121 products │ TF-IDF (4121 × 30,000) │ 74 taxons   │  │
-│  │ taxon_id ↔ taxon_name maps (163 label entries)         │  │
+│  │ 4,511 products │ TF-IDF (4511 × 30,000) │ 77 taxons   │  │
+│  │ taxon_id ↔ taxon_name maps (165 label entries)         │  │
 │  └────────────────────────────────────────────────────────┘  │
 │                          │                                   │
-│  Hybrid Ranker                                               │
+│  Three Retrieval Pipelines                                   │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │ 1. Content-Based (TF-IDF cosine similarity)            │  │
-│  │ 2. Popularity (interaction-weighted)                   │  │
-│  │ 3. RRF merge (CBF 60% + popularity 40%)                │  │
-│  │ 4. Session taxon boost (+25%)                          │  │
-│  │ 5. Basket-aware cross-sell / penalise duplicates       │  │
-│  │ 6. Limit-check price-tier filter                       │  │
-│  │ 7. Device-adaptive top-N truncation                    │  │
+│  │ 1. Content-Based Filtering (CBF)                       │  │
+│  │    TF-IDF cosine similarity over product text corpus   │  │
+│  │ 2. Item-Based Collaborative Filtering (CF)             │  │
+│  │    Co-interaction scoring on in-memory user-item matrix│  │
+│  │ 3. Popularity Fallback                                 │  │
+│  │    Interaction-weighted, taxon-scoped or global        │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                          │                                   │
+│  Hybrid Ranker (RRF merge + 5 re-rankers)                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │ 1. RRF merge (placement-tuned weights)                 │  │
+│  │ 2. Session taxon boost (+25%)                          │  │
+│  │ 3. Basket-aware cross-sell / penalise duplicates       │  │
+│  │ 4. Limit-check price-tier filter                       │  │
+│  │ 5. Shop diversity cap (max 5/shop)                     │  │
+│  │ 6. Device-adaptive top-N truncation                    │  │
 │  └────────────────────────────────────────────────────────┘  │
 │                          │                                   │
 │         POST /api/v1/feed/push ──► Shop's Feed API           │
@@ -140,40 +150,58 @@ $$S(u, p) = \sum_{e} w_e \cdot 0.5^{\,\Delta t_e / 7}$$
 
 ---
 
-## Recommendation Pipeline
+## Recommendation Pipelines
 
-### Content-Based Filtering (CBF)
+### 1. Content-Based Filtering (CBF) — `src/module/content_based.py`
 
 - **Vectoriser:** `TfidfVectorizer` with unigrams + bigrams, `max_features=30,000`, `sublinear_tf=True`
 - **Text corpus per product:** manufacturer (×3) + product names (×2) + category hierarchy + keywords + specs + details + taxon slug + price range
 - **Similarity:** L2-normalised rows → cosine = dot product → `scipy` sparse matrix multiply
 - **Seed:** user's top-scored products from interaction history
+- **`get_similar_products(seed_ids, top_k)`** — CBF from seed product vector
+- **`get_taxon_products(taxon_id, top_k)`** — products in taxon ranked by popularity/quality
+- **`embed_query_text(text)`** — vectorize free-text for future search integration
 
-### Popularity Fallback
+### 2. Item-Based Collaborative Filtering (CF) — `src/module/collaborative.py`
 
-- Global `product_id → cumulative_intent_score` counter
+Uses the live in-memory user–item interaction matrix that grows with every event.
+
+**Algorithm: co-interaction scoring**
+
+$$\text{CF\_score}(p_{\text{cand}}) = \sum_{p_s \in \text{seeds}} \sum_{u \in \text{co-users}(p_s)} w_s \cdot \frac{c_u}{c_u + 1} \cdot I(u, p_{\text{cand}})$$
+
+- **`get_cf_candidates(account_id, top_k)`** — for a user: find co-interactors of their seed products, aggregate what else those users liked
+- **`get_item_similar_products(product_id, top_k)`** — for a product: find users who touched it, aggregate their other interactions (used by the PDP panel)
+- **`cf_stats()`** — diagnostic: tracked users, interaction counts, coverage
+
+### 3. Popularity Fallback — `FeatureStore._popularity`
+
+- Global `product_id → cumulative_intent_score` counter (updated on every event)
 - Scoped by `taxon_id` when context is available
-- Used for cold-start users and to enrich CBF candidate sets
+- Used for cold-start users and as the third leg in 3-way RRF
 
 ### Hybrid Merge — Reciprocal Rank Fusion (RRF)
 
-$$\text{score}(p) = \frac{0.6}{60 + \text{rank}_{\text{CBF}}(p)} + \frac{0.4}{60 + \text{rank}_{\text{pop}}(p)}$$
+General formula for $k$ ranked lists:
+$$\text{score}(p) = \sum_{i} \frac{w_i}{K + \text{rank}_i(p)}$$  where $K = 60$
 
-### Re-ranking Layers (applied in order)
+Placement-tuned weights:
+
+| Placement | CBF | CF | Popularity |
+|---|---|---|---|
+| General / feed | 0.60 | — | 0.40 |
+| Taxon page | 0.45 | 0.30 | 0.25 |
+| Product page | 0.60 | 0.40 | — |
+| Basket page | 0.40 | 0.35 | 0.25 |
+
+### Re-ranking Layers (applied after merge)
 
 1. **Session taxon boost** — products in the user's last 3 browsed taxons get +25% score
-2. **Basket-aware** — cross-category products boosted ×1.15; same product_category as basket items penalised ×0.6
+2. **Basket-aware** — cross-category products boosted ×1.15; same `product_category` as basket items penalised ×0.6
 3. **Limit-check filter** — if `limit-events` fired this session, products above price tier `mid` are demoted ×0.5
-4. **Intent adjustment** — high-intent: conversion order preserved; low-intent: extra taxon diversity injected
-5. **Shop diversity cap** — max 5 products per shop per response
+4. **Intent adjustment** — high-intent (≥8.0): conversion order preserved; low-intent (≤2.0): extra taxon diversity injected
+5. **Shop diversity cap** — max 5 products per shop per response (max 3 in basket panel)
 6. **Device top-N** — miniprogram: 8 / mobile: 12 / desktop: 20
-
-### Multi-Taxon Feed
-
-`POST /api/v1/feed` generates per-taxon recommendation lists by:
-1. Taking the user's session taxon path (most recent first)
-2. Appending interaction-weighted historical taxons
-3. Generating per-taxon top-N with cross-taxon deduplication (each product appears only once)
 
 ### Cold-Start Strategy
 
@@ -182,7 +210,62 @@ $$\text{score}(p) = \frac{0.6}{60 + \text{rank}_{\text{CBF}}(p)} + \frac{0.4}{60
 | New user, no events | Global popularity by taxon |
 | User has `taxon_click` only | Taxon-scoped popularity |
 | User has `product_click` | CBF from clicked products |
-| User has order/cart history | Full hybrid pipeline |
+| User has order/cart history | Full hybrid CBF + CF + popularity |
+| CF data sparse | CBF-only or CBF+pop fallback |
+
+---
+
+## UI Placement Areas
+
+The engine serves three distinct recommendation panels on the shop frontend.
+
+### 1. Taxon / Category Page — `POST /api/v1/recommendations/taxon`
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Category: Laptop & Gaming                          │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐    │
+│  │ pid1 │ │ pid2 │ │ pid3 │ │ pid4 │ │ pid5 │ …  │
+│  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘    │
+└─────────────────────────────────────────────────────┘
+```
+
+Called when a user navigates to or scrolls a category page. Returns products filtered to the requested `taxon_id`, personalized by the user's CBF seeds and CF co-interactions within that category.
+
+### 2. Product Detail Page — `POST /api/v1/recommendations/product`
+
+```
+┌─────────────────────────────────────────────────────┐
+│  [Product Detail: ASUS ROG Laptop]                  │
+│  Price / Add to Cart / ...                          │
+│                                                     │
+│  ── You may also like ──────────────────────────── │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐    │
+│  │ pid1 │ │ pid2 │ │ pid3 │ │ pid4 │ │ pid5 │ …  │
+│  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘    │
+└─────────────────────────────────────────────────────┘
+```
+
+Called when a user opens a product page. Returns products similar to the anchor product using TF-IDF cosine similarity (CBF) blended with item-based CF co-purchase/co-view signals.
+
+### 3. Basket / Cart Page — `POST /api/v1/recommendations/basket`
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Your Cart                                          │
+│  ┌────────────────────────────────────────────────┐│
+│  │ pid_A — ASUS ROG Laptop          ×1  ₮4,100,000││
+│  │ pid_B — Gaming Mouse             ×1    ₮120,000 ││
+│  └────────────────────────────────────────────────┘│
+│                                                     │
+│  ── Complete your purchase ─────────────────────── │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐    │
+│  │ pid1 │ │ pid2 │ │ pid3 │ │ pid4 │ │ pid5 │ …  │
+│  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘    │
+└─────────────────────────────────────────────────────┘
+```
+
+Called when a user opens their cart. Returns complementary products from categories not already in the basket (cross-sell). Basket-aware reranker aggressively penalises same-category items and boosts cross-category complements.
 
 ---
 
@@ -402,9 +485,10 @@ marketplace-stream-data-recommendation-engine/
 │   ├── api/
 │   │   ├── app.py                  # FastAPI factory, lifespan (startup sync, periodic re-sync)
 │   │   ├── schemas/
-│   │   │   └── event.py            # Pydantic v2 request/response models
+│   │   │   └── event.py            # Pydantic v2 request/response models (all endpoints)
 │   │   ├── routes/
-│   │   │   ├── events.py           # All recommendation endpoints
+│   │   │   ├── events.py           # Stream ingestion + feed endpoints
+│   │   │   ├── recommendations.py  # Placement endpoints (taxon/product/basket)  ← NEW
 │   │   │   └── health.py           # /health, /catalog/status, /catalog/sync
 │   │   └── middleware/             # (reserved for auth / rate limiting)
 │   │
@@ -416,13 +500,17 @@ marketplace-stream-data-recommendation-engine/
 │       │                           #   popularity, taxon maps
 │       ├── catalog_sync.py         # PG fetch, field normalization, TF-IDF build,
 │       │                           #   taxon maps, scheduled re-sync
-│       ├── content_based.py        # Cosine similarity search over TF-IDF matrix
+│       ├── content_based.py        # CBF: TF-IDF cosine similarity search
+│       ├── collaborative.py        # CF: item-based co-interaction scoring  ← NEW
 │       ├── hybrid_ranker.py        # RRF merge, context re-rankers, recommend(),
 │       │                           #   recommend_multi_taxon()
 │       ├── settings.py             # Oracle credentials via pydantic-settings / .env
 │       ├── database.py             # Oracle import/export/execute
 │       ├── data_minification.py    # Pandas memory reducer (int/float downcast)
 │       └── helper.py               # @timeit, @logging_timer decorators
+│
+├── docs/
+│   └── API_GUIDE.md                # Comprehensive API integration guide  ← NEW
 │
 ├── notebooks/
 │   ├── test.ipynb                  # Data exploration + live API integration cells
