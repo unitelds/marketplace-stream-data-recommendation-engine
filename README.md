@@ -183,7 +183,7 @@ $$\text{CF\_score}(p_{\text{cand}}) = \sum_{p_s \in \text{seeds}} \sum_{u \in \t
 ### Hybrid Merge — Reciprocal Rank Fusion (RRF)
 
 General formula for $k$ ranked lists:
-$$\text{score}(p) = \sum_{i} \frac{w_i}{K + \text{rank}_i(p)}$$  where $K = 60$
+$$\text{score}(p) = \sum_{i} \frac{w_i}{K + \text{rank}_i(p)}, \quad K = 60$$
 
 Placement-tuned weights:
 
