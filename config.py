@@ -143,6 +143,9 @@ ERROR_REPORT_DIR = os.getenv("TOKI_ERROR_REPORT_DIR", "reports/error_analysis")
 MAX_PRODUCTS_PER_CATEGORY = 100
 DEFAULT_FEED_SHUFFLE = True
 PRIORITY_PRODUCT_MAX = 20
+# Max wall-clock seconds to wait for inline recs on the events endpoint.
+# Recs that don't finish within this window are dropped; events are always accepted.
+EVENTS_INFER_TIMEOUT = float(os.getenv("TOKI_EVENTS_INFER_TIMEOUT", 8.0))
 
 # Expanded category taxonomy for computer components etc.
 EXPANDED_TAXON_ALIASES = {
@@ -205,7 +208,7 @@ SCORE_WEIGHTS = {
 # ─────────────────────────────────────────────────────────
 # HANDSET FEED — per-user recommendations via external API
 # ─────────────────────────────────────────────────────────
-MARKETPLACE_API_BASE_URL = "http://10.21.60.94:9000/marketplace"  # {base}/{user_id}
+MARKETPLACE_API_BASE_URL = "https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation"  # {base}/{user_id}
 MARKETPLACE_API_TIMEOUT = 2  # seconds — fall back to catalogue scoring on timeout
 
 HANDSET_FEED_TABLE = "tmp_marketplace_handset_feed"  # retained for reference

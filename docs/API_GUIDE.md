@@ -7,8 +7,9 @@
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [Quick Start](#2-quick-start)
-3. [Event Ingestion Endpoints](#3-event-ingestion-endpoints)
+2. [Authentication](#2-authentication)
+3. [Quick Start](#3-quick-start)
+4. [Event Ingestion Endpoints](#4-event-ingestion-endpoints)
    - [POST /api/v1/events](#post-apiv1events)
    - [POST /api/v1/consumer-events](#post-apiv1consumer-events)
 4. [UI Placement Recommendation Endpoints](#4-ui-placement-recommendation-endpoints)
@@ -50,7 +51,92 @@ All three are merged via **Reciprocal Rank Fusion (RRF)** with placement-tuned w
 
 ---
 
-## 2. Quick Start
+## 2. Authentication
+
+Every request to `/api/v1/*` must carry a valid API key (except `/api/v1/health`, `/docs`, `/redoc`, and `/openapi.json`).
+
+### Key tiers
+
+| Tier | Rate limit | Intended caller |
+|---|---|---|
+| `internal` | 500 req/s | Backend services, batch pipelines |
+| `standard` | 100 req/s | Shop frontend clients |
+| `readonly` | 20 req/s | Analytics / monitoring |
+
+Keys are configured on the server via the `TOKI_API_KEYS` environment variable:
+
+```
+TOKI_API_KEYS="your-key-1:internal,your-key-2:standard,your-key-3:readonly"
+```
+
+A built-in key `dev-local-unsafe` (tier `internal`) is active in **non-production** environments only.
+
+### Passing the key
+
+**Option 1 — HTTP header (recommended)**
+
+```bash
+
+
+**Option 2 — Query parameter**
+
+```bash
+curl -X POST "http://<host>:8018/api/v1/events?api_key=your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{ ... }'
+```
+
+### Client examples
+
+**Python (requests)**
+
+```python
+import requests
+
+API_KEY = "your-api-key"
+BASE_URL = "http://<host>:8018"
+
+resp = requests.post(
+    f"{BASE_URL}/api/v1/recommendations/taxon",
+    headers={"X-API-Key": API_KEY},
+    json={
+        "account_id": "6a5e47214aeec353171ccaa0",
+        "taxon_id": "698c3ed3e783dbd39ed224f0",
+        "top_n": 20,
+    },
+)
+resp.raise_for_status()
+print(resp.json())
+```
+
+**JavaScript (fetch)**
+
+```js
+const resp = await fetch("http://<host>:8018/api/v1/recommendations/taxon", {
+  method: "POST",
+  headers: {
+    "X-API-Key": "your-api-key",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    account_id: "6a5e47214aeec353171ccaa0",
+    taxon_id: "698c3ed3e783dbd39ed224f0",
+    top_n: 20,
+  }),
+});
+const data = await resp.json();
+```
+
+### Error responses
+
+| HTTP status | Meaning |
+|---|---|
+| `401 Unauthorized` | Key missing or not recognised |
+| `429 Too Many Requests` | Rate limit for this key's tier exceeded |
+
+---
+
+## 3. Quick Start
 
 ### Step 1 — Send an engagement event
 

@@ -170,7 +170,15 @@ def parse_activity_data(raw: Any) -> dict:
         return {}
 
     account_id = _first(parsed, _ACCOUNT_KEYS)
+    # cart-events nest accountId inside cart sub-dict
+    if not account_id and isinstance(parsed.get("cart"), dict):
+        account_id = _first(parsed["cart"], _ACCOUNT_KEYS)
+
     product_id = _first(parsed, _PRODUCT_KEYS)
+    # cart-events nest productId inside item sub-dict
+    if not product_id and isinstance(parsed.get("item"), dict):
+        product_id = _first(parsed["item"], _PRODUCT_KEYS)
+
     action = _first(parsed, _ACTION_KEYS, "default")
     session_id = _first(parsed, _SESSION_KEYS)
     quantity = _first(parsed, _QUANTITY_KEYS, 1)

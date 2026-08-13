@@ -23,7 +23,7 @@ from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-from src.api.middleware.auth import APIKeyMiddleware, auth_stats
+from src.api.routes.dashboard import router as dashboard_router
 from src.api.routes.events import router as events_router
 from src.api.routes.health import router as health_router
 from src.api.routes.recommendations import router as recommendations_router
@@ -109,9 +109,8 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json",
     )
 
-    # Middleware stack (applied bottom-up: timing → auth → cors → route)
+    # Middleware stack
     app.add_middleware(_TimingMiddleware)
-    app.add_middleware(APIKeyMiddleware)
 
     # CORS — restrict in production via environment variable
     allowed_origins = os.getenv("TOKI_CORS_ORIGINS", "*").split(",")
@@ -127,11 +126,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(events_router)
     app.include_router(recommendations_router)
-
-    @app.get("/api/v1/auth/stats", include_in_schema=True, tags=["health"])
-    async def _auth_stats():
-        """API key usage counters and rate-limit bucket state."""
-        return auth_stats()
+    app.include_router(dashboard_router)
 
     # Root redirect to docs
     @app.get("/", include_in_schema=False)

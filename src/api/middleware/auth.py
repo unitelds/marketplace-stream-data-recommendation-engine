@@ -54,7 +54,14 @@ _KEY_REGISTRY: dict[str, str] = {}
 
 # Exempt paths — exact or prefix match, no API key required
 _EXEMPT_EXACT = {"/", "/favicon.ico"}
-_EXEMPT_PREFIXES = ("/docs", "/redoc", "/openapi.json", "/api/v1/health")
+_EXEMPT_PREFIXES = (
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/api/v1/health",
+    "/api/v1/metrics",
+    "/dashboard",
+)
 
 
 def _load_keys() -> None:

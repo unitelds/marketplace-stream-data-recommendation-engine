@@ -12,6 +12,7 @@ POST /api/v1/feed/push        -- generate feed AND POST it to shop's API
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -41,9 +42,56 @@ from src.module.event_processor import (
 )
 from src.module.feature_store import store
 from src.module.hybrid_ranker import recommend, recommend_multi_taxon
+from src.module.metrics import metrics
 from src.module.user_history_loader import ensure_user_history, is_loaded
 
+try:
+    from config import EVENTS_INFER_TIMEOUT
+except ImportError:
+    EVENTS_INFER_TIMEOUT = 8.0
+
 router = APIRouter(prefix="/api/v1", tags=["recommendations"])
+
+
+# ---------------------------------------------------------------------------
+# Concurrent recommendation helper
+# ---------------------------------------------------------------------------
+
+
+async def _run_recs_concurrent(
+    affected: dict[str, Optional[str]],
+    timeout: float = EVENTS_INFER_TIMEOUT,
+) -> list[dict]:
+    """Run recommend() for every affected user concurrently in the thread pool.
+
+    Returns partial results for users whose recs completed within `timeout`.
+    Users that time out are silently dropped — their events are still stored.
+    scipy/numpy TF-IDF ops release the GIL so executor threads run in true parallel.
+    """
+    if not affected:
+        return []
+    loop = asyncio.get_event_loop()
+    futures: dict[asyncio.Future, str] = {
+        loop.run_in_executor(
+            None,
+            lambda acc=acc, tx=tx: recommend(acc, context_taxon_id=tx),
+        ): acc
+        for acc, tx in affected.items()
+    }
+    done, pending = await asyncio.wait(set(futures), timeout=timeout)
+    if pending:
+        metrics.record_infer_timeout(len(pending))
+        logger.warning(
+            f"Events infer timeout ({timeout}s): "
+            f"{len(pending)}/{len(futures)} users skipped inline recs"
+        )
+    results = []
+    for fut in done:
+        try:
+            results.append(fut.result())
+        except Exception as exc:
+            logger.debug(f"Recommendation error (non-critical): {exc}")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +185,61 @@ _DELIVERY_TABLE_READY = False
 _DELIVERY_WRITER_RUNNING = False
 _DELIVERY_BATCH_SIZE = 200
 _DELIVERY_FLUSH_INTERVAL = 5.0  # seconds between flushes
+
+# Per-worker JSONL log files — same pattern as metrics worker snapshots so the
+# GET /logs/* endpoints can aggregate across all gunicorn workers.
+import glob as _glob
+import json as _logjson
+import re as _re
+
+_MONGO_ID_RE = _re.compile(r'^[a-f0-9]{24}$')
+
+
+def _is_valid_account_id(account_id: str) -> bool:
+    """Shop API requires a 24-char hex MongoDB ObjectId."""
+    return bool(account_id and _MONGO_ID_RE.match(account_id))
+
+
+_LOG_TMP = "/tmp"
+_INGEST_PFX = "toki_ingest_log_"
+_PUSH_PFX = "toki_push_log_"
+_LOG_MAX_LINES = 600  # rotate file above this many lines
+
+
+def _write_log(prefix: str, entry: dict) -> None:
+    import os as _os
+
+    path = f"{_LOG_TMP}/{prefix}{_os.getpid()}.jsonl"
+    try:
+        with open(path, "a") as fh:
+            fh.write(_logjson.dumps(entry) + "\n")
+        # Rotate: keep only last _LOG_MAX_LINES when file grows large
+        if _os.path.getsize(path) > 120_000:
+            with open(path) as fh:
+                lines = fh.readlines()
+            with open(path, "w") as fh:
+                fh.writelines(lines[-_LOG_MAX_LINES:])
+    except Exception:
+        pass
+
+
+def _read_logs(prefix: str, limit: int) -> tuple[list[dict], int]:
+    """Aggregate from all worker JSONL files, sort newest-first."""
+    entries: list[dict] = []
+    for path in _glob.glob(f"{_LOG_TMP}/{prefix}*.jsonl"):
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(_logjson.loads(line))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    entries.sort(key=lambda x: x.get("ts", ""), reverse=True)
+    return entries[:limit], len(entries)
 
 
 def _enqueue_delivery(account_id: str, product_ids: list[str], strategy: str) -> None:
@@ -245,6 +348,7 @@ async def ingest_events(
 ) -> EventsResponse:
     processed, failed = 0, 0
     affected: dict[str, Optional[str]] = {}
+    activity_counts: dict[str, int] = {}
 
     for event in payload.events:
         try:
@@ -258,18 +362,40 @@ async def ingest_events(
                 if acc:
                     affected[acc] = norm.get("taxon_id") or affected.get(acc)
             processed += 1
+            activity_counts[event.activity_name] = (
+                activity_counts.get(event.activity_name, 0) + 1
+            )
         except Exception as exc:
             logger.warning(f"Event error [{event.activity_name}]: {exc}")
             failed += 1
 
+    metrics.record_ingestion(
+        processed=processed, failed=failed, activity_counts=activity_counts
+    )
+    _write_log(
+        _INGEST_PFX,
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "source": "events",
+            "processed": processed,
+            "failed": failed,
+            "users": list(affected.keys())[:20],
+            "event_types": activity_counts,
+        },
+    )
     recommendations: list[RecommendationResult] = []
-    for account_id, context_taxon in affected.items():
-        result = recommend(account_id, context_taxon_id=context_taxon)
+    for result in await _run_recs_concurrent(affected):
         recommendations.append(RecommendationResult(**result))
         if result["recommendations"]:
+            metrics.record_recommendations(
+                count=len(result["recommendations"]),
+                strategy=result["strategy"],
+                endpoint="events",
+                device=result.get("device", "unknown"),
+            )
             background_tasks.add_task(
                 _log_delivered,
-                account_id,
+                result["id"],
                 result["recommendations"],
                 result["strategy"],
             )
@@ -304,6 +430,7 @@ async def ingest_consumer_events(
 ) -> EventsResponse:
     processed, failed = 0, 0
     affected: dict[str, Optional[str]] = {}
+    activity_counts: dict[str, int] = {}
 
     for row in payload.events:
         try:
@@ -317,18 +444,38 @@ async def ingest_consumer_events(
                 if acc:
                     affected[acc] = norm.get("taxon_id") or affected.get(acc)
             processed += 1
+            activity_counts[row.event_name] = activity_counts.get(row.event_name, 0) + 1
         except Exception as exc:
             logger.warning(f"Consumer event error [{row.event_name}]: {exc}")
             failed += 1
 
+    metrics.record_ingestion(
+        processed=processed, failed=failed, activity_counts=activity_counts
+    )
+    _write_log(
+        _INGEST_PFX,
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "source": "consumer-events",
+            "processed": processed,
+            "failed": failed,
+            "users": list(affected.keys())[:20],
+            "event_types": activity_counts,
+        },
+    )
     recommendations: list[RecommendationResult] = []
-    for account_id, context_taxon in affected.items():
-        result = recommend(account_id, context_taxon_id=context_taxon)
+    for result in await _run_recs_concurrent(affected):
         recommendations.append(RecommendationResult(**result))
         if result["recommendations"]:
+            metrics.record_recommendations(
+                count=len(result["recommendations"]),
+                strategy=result["strategy"],
+                endpoint="consumer_events",
+                device=result.get("device", "unknown"),
+            )
             background_tasks.add_task(
                 _log_delivered,
-                account_id,
+                result["id"],
                 result["recommendations"],
                 result["strategy"],
             )
@@ -473,19 +620,21 @@ def _bg_load_oracle(account_id: str) -> None:
 
 def _auto_push_feed(account_id: str, taxon_feeds: list[TaxonFeedItem]) -> None:
     """Background task: push feed to shop's configured API endpoint."""
+    if not _is_valid_account_id(account_id):
+        logger.debug(
+            f"Auto-push skipped: accountId '{account_id}' is not a 24-char hex ObjectId"
+        )
+        return
     try:
         from config import MARKETPLACE_API_BASE_URL, MARKETPLACE_API_TIMEOUT
 
-        push_url = f"{MARKETPLACE_API_BASE_URL}/{account_id}"
+        push_url = MARKETPLACE_API_BASE_URL
         payload = {
-            "id": account_id,
-            "taxon_feeds": [
-                {
-                    "taxon_id": tf.taxon_id,
-                    "taxon_name": tf.taxon_name,
-                    "recommendations": tf.recommendations,
-                }
+            "accountId": account_id,
+            "products": [
+                {"productId": pid, "taxonId": tf.taxon_id}
                 for tf in taxon_feeds
+                for pid in tf.recommendations
             ],
         }
         import httpx as _httpx
@@ -497,7 +646,29 @@ def _auto_push_feed(account_id: str, taxon_feeds: list[TaxonFeedItem]) -> None:
         logger.info(
             f"Feed auto-pushed to {push_url}: {total} products [{resp.status_code}]"
         )
+        _write_log(
+            _PUSH_PFX,
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "account_id": account_id,
+                "products_count": total,
+                "push_url": push_url,
+                "push_status": "ok",
+                "push_error": None,
+            },
+        )
     except Exception as exc:
+        _write_log(
+            _PUSH_PFX,
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "account_id": account_id,
+                "products_count": 0,
+                "push_url": None,
+                "push_status": "failed",
+                "push_error": str(exc)[:120],
+            },
+        )
         logger.debug(f"Feed auto-push failed (non-critical): {exc}")
 
 
@@ -541,34 +712,50 @@ async def feed_push(
         try:
             from config import MARKETPLACE_API_BASE_URL
 
-            push_url = f"{MARKETPLACE_API_BASE_URL}/{req.account_id}"
+            push_url = MARKETPLACE_API_BASE_URL
         except ImportError:
             push_url = None
 
     push_status, push_error = "not_attempted", None
 
     if push_url and taxon_feeds:
-        push_payload = {
-            "id": req.account_id,
-            "taxon_feeds": [
+        if not _is_valid_account_id(req.account_id):
+            push_status = "skipped"
+            push_error = f"accountId '{req.account_id}' must be a 24-char hex string (MongoDB ObjectId)"
+            logger.warning(push_error)
+        else:
+            push_payload = {
+                "accountId": req.account_id,
+                "products": [
+                    {"productId": pid, "taxonId": tf.taxon_id}
+                    for tf in taxon_feeds
+                    for pid in tf.recommendations
+                ],
+            }
+            try:
+                async with httpx.AsyncClient(
+                    timeout=req.push_timeout_seconds
+                ) as client:
+                    resp = await client.post(push_url, json=push_payload)
+                    resp.raise_for_status()
+                push_status = "ok"
+                logger.info(f"Feed pushed to {push_url} [{resp.status_code}]")
+            except Exception as exc:
+                push_status = "failed"
+                push_error = str(exc)[:200]
+                logger.warning(f"Feed push failed [{push_url}]: {exc}")
+            _write_log(
+                _PUSH_PFX,
                 {
-                    "taxon_id": tf.taxon_id,
-                    "taxon_name": tf.taxon_name,
-                    "recommendations": tf.recommendations,
-                }
-                for tf in taxon_feeds
-            ],
-        }
-        try:
-            async with httpx.AsyncClient(timeout=req.push_timeout_seconds) as client:
-                resp = await client.post(push_url, json=push_payload)
-                resp.raise_for_status()
-            push_status = "ok"
-            logger.info(f"Feed pushed to {push_url} [{resp.status_code}]")
-        except Exception as exc:
-            push_status = "failed"
-            push_error = str(exc)[:200]
-            logger.warning(f"Feed push failed [{push_url}]: {exc}")
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "account_id": req.account_id,
+                    "products_count": len(push_payload["products"]),
+                    "strategy": result.get("strategy"),
+                    "push_url": push_url,
+                    "push_status": push_status,
+                    "push_error": push_error,
+                },
+            )
 
     return FeedPushResponse(
         id=result["id"],
@@ -581,3 +768,20 @@ async def feed_push(
         push_url=push_url,
         push_error=push_error,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/logs/ingest  &  GET /api/v1/logs/push
+# ---------------------------------------------------------------------------
+
+
+@router.get("/logs/ingest", summary="Recent ingest log", response_model=dict)
+async def get_ingest_log(limit: int = 50) -> dict:
+    entries, total = _read_logs(_INGEST_PFX, limit)
+    return {"entries": entries, "total_stored": total}
+
+
+@router.get("/logs/push", summary="Recent push log", response_model=dict)
+async def get_push_log(limit: int = 50) -> dict:
+    entries, total = _read_logs(_PUSH_PFX, limit)
+    return {"entries": entries, "total_stored": total}

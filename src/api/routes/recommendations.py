@@ -40,6 +40,7 @@ from src.module.hybrid_ranker import (
     _limit_check_filter,
     _session_taxon_boost,
 )
+from src.module.metrics import metrics
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["placements"])
 
@@ -201,6 +202,9 @@ async def recommend_taxon_page(
     final_ids = [pid for pid, _ in merged[:effective_top_n]]
 
     response_taxon = req.taxon_id
+    metrics.record_recommendations(
+        count=len(final_ids), strategy=strategy, endpoint="taxon", device=device_type
+    )
     background_tasks.add_task(_log_placement, req.account_id, final_ids, "taxon_page")
 
     return PlacementRecommendationResponse(
@@ -294,6 +298,9 @@ async def recommend_product_page(
     final_ids = [pid for pid, _ in merged[:effective_top_n]]
 
     anchor_taxon_id = store.product_features.get(req.product_id, {}).get("taxon_id")
+    metrics.record_recommendations(
+        count=len(final_ids), strategy=strategy, endpoint="product", device=device_type
+    )
     background_tasks.add_task(_log_placement, req.account_id, final_ids, "product_page")
 
     return PlacementRecommendationResponse(
@@ -399,6 +406,9 @@ async def recommend_basket_page(
     merged = _diversity_cap(merged, max_per_shop=3)  # tighter diversity in basket panel
 
     final_ids = [pid for pid, _ in merged[:effective_top_n]]
+    metrics.record_recommendations(
+        count=len(final_ids), strategy=strategy, endpoint="basket", device=device_type
+    )
     background_tasks.add_task(_log_placement, req.account_id, final_ids, "basket_page")
 
     return PlacementRecommendationResponse(
