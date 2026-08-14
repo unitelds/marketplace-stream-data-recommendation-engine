@@ -41,12 +41,17 @@ from locust.stats import stats_history, stats_printer
 
 API_KEY = os.getenv("STRESS_API_KEY", "")
 BASE_URL = os.getenv("STRESS_HOST", "http://localhost:8018")
+MARKETPLACE_PUSH_URL = os.getenv(
+    "STRESS_PUSH_URL",
+    "https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation",
+)
 HEADERS = {"Content-Type": "application/json"}
 
 # Synthetic catalog IDs sampled from the live catalog
 # (fetched once at startup in programmatic mode)
 _SAMPLE_PRODUCT_IDS: list[str] = []
 _SAMPLE_TAXON_IDS: list[str] = []
+_SEEDER_ACCOUNTS: list[str] = []  # real 24-hex ObjectIds used for marketplace push
 
 
 def _synthetic_account_id() -> str:
@@ -282,6 +287,28 @@ class MarketplaceUser(FastHttpUser):
             name="/api/v1/feed",
         )
 
+    # ── Rare: push feed to staging marketplace (weight 1, real accounts only) ──
+
+    @task(1)
+    def push_to_marketplace(self):
+        """Generate feed and push to the staging marketplace recommendation endpoint."""
+        # Marketplace rejects synthetic ObjectIds — use real seeder accounts
+        account_id = (
+            random.choice(_SEEDER_ACCOUNTS) if _SEEDER_ACCOUNTS else self.account_id
+        )
+        self.client.post(
+            "/api/v1/feed/push",
+            json={
+                "account_id": account_id,
+                "top_taxons": 3,
+                "top_n_per_taxon": 10,
+                "shop_feed_url": MARKETPLACE_PUSH_URL,
+                "push_timeout_seconds": 5.0,
+            },
+            headers=self.headers,
+            name="POST /api/v1/feed/push [marketplace]",
+        )
+
     # ── Rare: order (weight 1) ─────────────────────────────────────────────────
 
     @task(1)
@@ -350,11 +377,16 @@ def _fetch_sample_ids(base_url: str, api_key: str) -> None:
                 for pid in tf.get("recommendations", []):
                     if pid not in _SAMPLE_PRODUCT_IDS:
                         _SAMPLE_PRODUCT_IDS.append(pid)
+            # Only add accounts that returned a non-empty feed (i.e. real accounts)
+            if feed.get("total_products", 0) > 0 and acct not in _SEEDER_ACCOUNTS:
+                _SEEDER_ACCOUNTS.append(acct)
         except Exception as exc:
             print(f"[WARN] Seed feed failed for {acct}: {exc}")
 
     print(
-        f"Seeded: {len(_SAMPLE_PRODUCT_IDS)} product IDs, {len(_SAMPLE_TAXON_IDS)} taxon IDs"
+        f"Seeded: {len(_SAMPLE_PRODUCT_IDS)} product IDs, "
+        f"{len(_SAMPLE_TAXON_IDS)} taxon IDs, "
+        f"{len(_SEEDER_ACCOUNTS)} push-eligible accounts"
     )
 
 

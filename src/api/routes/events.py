@@ -399,6 +399,9 @@ async def ingest_events(
                 result["recommendations"],
                 result["strategy"],
             )
+    # Push fresh multi-taxon feed to marketplace for every affected valid account
+    for acc in affected:
+        background_tasks.add_task(_bg_push_feed_for_user, acc)
     return EventsResponse(
         status="accepted",
         processed=processed,
@@ -479,6 +482,9 @@ async def ingest_consumer_events(
                 result["recommendations"],
                 result["strategy"],
             )
+    # Push fresh multi-taxon feed to marketplace for every affected valid account
+    for acc in affected:
+        background_tasks.add_task(_bg_push_feed_for_user, acc)
     return EventsResponse(
         status="accepted",
         processed=processed,
@@ -585,7 +591,9 @@ async def feed(
 
     # Auto-push to shop feed endpoint in background (fire-and-forget)
     if taxon_feeds:
-        background_tasks.add_task(_auto_push_feed, req.account_id, taxon_feeds)
+        background_tasks.add_task(
+            _auto_push_feed, req.account_id, taxon_feeds, result.get("strategy", "")
+        )
 
     return MultiTaxonResponse(
         id=result["id"],
@@ -618,7 +626,9 @@ def _bg_load_oracle(account_id: str) -> None:
         loop.close()
 
 
-def _auto_push_feed(account_id: str, taxon_feeds: list[TaxonFeedItem]) -> None:
+def _auto_push_feed(
+    account_id: str, taxon_feeds: list[TaxonFeedItem], strategy: str = ""
+) -> None:
     """Background task: push feed to shop's configured API endpoint."""
     if not _is_valid_account_id(account_id):
         logger.debug(
@@ -652,24 +662,72 @@ def _auto_push_feed(account_id: str, taxon_feeds: list[TaxonFeedItem]) -> None:
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "account_id": account_id,
                 "products_count": total,
+                "strategy": strategy,
                 "push_url": push_url,
                 "push_status": "ok",
                 "push_error": None,
             },
         )
     except Exception as exc:
+        push_url_safe = None
+        try:
+            from config import MARKETPLACE_API_BASE_URL
+
+            push_url_safe = MARKETPLACE_API_BASE_URL
+        except Exception:
+            pass
         _write_log(
             _PUSH_PFX,
             {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "account_id": account_id,
                 "products_count": 0,
-                "push_url": None,
+                "strategy": strategy,
+                "push_url": push_url_safe,
                 "push_status": "failed",
-                "push_error": str(exc)[:120],
+                "push_error": str(exc)[:200],
             },
         )
-        logger.debug(f"Feed auto-push failed (non-critical): {exc}")
+        logger.warning(f"Feed auto-push failed [{account_id}]: {exc}")
+
+
+def _bg_push_feed_for_user(account_id: str) -> None:
+    """Background: regenerate multi-taxon feed and push to marketplace after event ingestion."""
+    ts = datetime.now(timezone.utc).isoformat()
+    if not _is_valid_account_id(account_id):
+        _write_log(
+            _PUSH_PFX,
+            {
+                "ts": ts,
+                "account_id": account_id,
+                "products_count": 0,
+                "strategy": "",
+                "push_url": None,
+                "push_status": "skipped",
+                "push_error": f"invalid account_id (not a 24-char hex ObjectId): {account_id!r}",
+            },
+        )
+        logger.debug(f"Push skipped — invalid account_id: {account_id!r}")
+        return
+    result = recommend_multi_taxon(account_id, top_taxons=3, top_n_per_taxon=10)
+    taxon_feeds = [TaxonFeedItem(**tf) for tf in result.get("taxon_feeds", [])]
+    if not taxon_feeds:
+        # cold-start: no interaction history yet — log so the dashboard shows it
+        _write_log(
+            _PUSH_PFX,
+            {
+                "ts": ts,
+                "account_id": account_id,
+                "products_count": 0,
+                "strategy": result.get("strategy", ""),
+                "push_url": None,
+                "push_status": "skipped",
+                "push_error": "empty feed — no interaction history yet (cold start)",
+            },
+        )
+        logger.debug(f"Push skipped — cold start, no feed for {account_id}")
+        return
+    _auto_push_feed(account_id, taxon_feeds, result.get("strategy", ""))
 
 
 @router.post(

@@ -614,24 +614,35 @@ function renderIngestLog(data) {
 }
 
 function renderPushLog(data) {
-  $("push-total").textContent = `${data.total_stored} stored`;
-  const rows = (data.entries || []).slice(0, 10).map(e => {
-    const ok = e.push_status === "ok";
+  const entries = data.entries || [];
+  const failed  = entries.filter(e => e.push_status === "failed").length;
+  const failBadge = failed
+    ? ` <span style="background:#5c1a0a;color:#f87171;border-radius:4px;padding:1px 6px;font-size:.68rem;font-weight:600">\u26a0 ${failed} failed</span>`
+    : "";
+  $("push-total").innerHTML = `${data.total_stored} stored${failBadge}`;
+
+  const rows = entries.slice(0, 10).map(e => {
+    const ok   = e.push_status === "ok";
     const skip = e.push_status === "skipped";
+    const fail = e.push_status === "failed";
     const statusColor = ok ? "#4ade80" : (skip ? "#fbbf24" : "#f87171");
+    const rowBg = fail ? "background:rgba(248,113,113,.07);" : "";
     const acct = e.account_id
       ? `<span title="${e.account_id}" style="font-family:monospace">${e.account_id.slice(0, 10)}&hellip;</span>`
       : "\u2014";
-    const errText = e.push_error
-      ? `<span title="${e.push_error}" style="color:#f87171;cursor:help">${e.push_error.slice(0, 28)}&hellip;</span>`
+    const errHtml = e.push_error
+      ? `<details style="cursor:pointer">
+           <summary style="color:#f87171;font-size:.7rem;list-style:none">\u26a0 ${e.push_error.slice(0, 40)}${e.push_error.length > 40 ? "&hellip;" : ""}</summary>
+           <div style="color:#f87171;font-size:.68rem;padding-top:3px;word-break:break-all">${e.push_error}</div>
+         </details>`
       : "";
-    return `<tr>
+    return `<tr style="${rowBg}">
       <td style="white-space:nowrap;color:#6b8ba4;font-size:.7rem">${fmtTs(e.ts)}</td>
       <td style="font-size:.72rem;color:#e2e8f0">${acct}</td>
       <td class="text-end" style="color:#38bdf8">${e.products_count ?? 0}</td>
-      <td style="color:#94a3b8">${e.strategy || "\u2014"}</td>
-      <td><span style="color:${statusColor}">${e.push_status || "\u2014"}</span></td>
-      <td style="font-size:.7rem">${errText}</td>
+      <td style="color:#94a3b8;font-size:.75rem">${e.strategy || "\u2014"}</td>
+      <td><span style="color:${statusColor};font-weight:${fail ? "600" : "400"}">${e.push_status || "\u2014"}</span></td>
+      <td>${errHtml}</td>
     </tr>`;
   });
   $("log-push").innerHTML = rows.join("") ||
