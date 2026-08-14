@@ -39,9 +39,9 @@ from locust.stats import stats_history, stats_printer
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-API_KEY = os.getenv("STRESS_API_KEY", "toki-internal-key")
+API_KEY = os.getenv("STRESS_API_KEY", "")
 BASE_URL = os.getenv("STRESS_HOST", "http://localhost:8018")
-HEADERS = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+HEADERS = {"Content-Type": "application/json"}
 
 # Synthetic catalog IDs sampled from the live catalog
 # (fetched once at startup in programmatic mode)
@@ -181,7 +181,7 @@ class MarketplaceUser(FastHttpUser):
         self.account_id = _synthetic_account_id()
         self.session_id = uuid.uuid4().hex
         self.basket: list[str] = []
-        self.headers = HEADERS
+        self.headers = {"Content-Type": "application/json"}
 
     # ── Heavy: taxon browse + recommendations (weight 6) ──────────────────────
 
@@ -311,18 +311,51 @@ def _fetch_sample_ids(base_url: str, api_key: str) -> None:
     """Pre-load real product/taxon IDs from the live catalog before the test."""
     import urllib.request
 
-    req = urllib.request.Request(
-        f"{base_url}/api/v1/catalog/status",
-        headers={"X-API-Key": api_key},
-    )
+    # Catalog health check
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(
+            urllib.request.Request(f"{base_url}/api/v1/catalog/status"), timeout=5
+        ) as resp:
             data = json.loads(resp.read())
         print(
             f"Catalog: {data['catalog_size']} products, {data['taxons_with_products']} taxons"
         )
     except Exception as exc:
-        print(f"[WARN] Could not prefetch catalog stats: {exc}")
+        print(f"[WARN] Could not fetch catalog stats: {exc}")
+
+    # Harvest real product + taxon IDs via feed endpoint using known seeder accounts
+    seeder_accounts = [
+        "66fbc5824e022311128232ae",
+        "5ff870ee4f636263bd482270",
+        "6a5e47214aeec353171ccaa0",
+        "64b7b484fa4f99d010979ea0",
+        "5ff870ee4f636263bd482270",
+    ]
+    for acct in seeder_accounts:
+        body = json.dumps(
+            {"account_id": acct, "top_taxons": 10, "top_n_per_taxon": 30}
+        ).encode()
+        req = urllib.request.Request(
+            f"{base_url}/api/v1/feed",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                feed = json.loads(resp.read())
+            for tf in feed.get("taxon_feeds", []):
+                if tf["taxon_id"] not in _SAMPLE_TAXON_IDS:
+                    _SAMPLE_TAXON_IDS.append(tf["taxon_id"])
+                for pid in tf.get("recommendations", []):
+                    if pid not in _SAMPLE_PRODUCT_IDS:
+                        _SAMPLE_PRODUCT_IDS.append(pid)
+        except Exception as exc:
+            print(f"[WARN] Seed feed failed for {acct}: {exc}")
+
+    print(
+        f"Seeded: {len(_SAMPLE_PRODUCT_IDS)} product IDs, {len(_SAMPLE_TAXON_IDS)} taxon IDs"
+    )
 
 
 def run_programmatic(users: int, spawn_rate: int, duration_seconds: int) -> None:
@@ -382,12 +415,13 @@ def _print_summary(stats) -> None:
     ):
         if entry.num_requests == 0:
             continue
+        endpoint_label = name[0] if isinstance(name, tuple) else str(name)
         p50 = entry.get_response_time_percentile(0.50) or 0
         p95 = entry.get_response_time_percentile(0.95) or 0
         p99 = entry.get_response_time_percentile(0.99) or 0
         fail = entry.num_failures
         print(
-            f"  {name[1]:45s} "
+            f"  {endpoint_label:50s} "
             f"n={entry.num_requests:6d} "
             f"p50={p50:4.0f}ms  p95={p95:5.0f}ms  p99={p99:5.0f}ms  "
             f"fail={fail}"

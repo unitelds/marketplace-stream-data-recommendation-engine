@@ -278,7 +278,7 @@ Base URL: `http://0.0.0.0:8018` (local) | Interactive docs: `/docs`
 Liveness check. Always returns `200`.
 
 ```json
-{ "status": "ok", "catalog_ready": true, "version": "4.1.0" }
+{ "status": "ok", "catalog_ready": true, "version": "4.2.0" }
 ```
 
 ### `GET /api/v1/catalog/status`
@@ -487,10 +487,13 @@ marketplace-stream-data-recommendation-engine/
 │   │   ├── schemas/
 │   │   │   └── event.py            # Pydantic v2 request/response models (all endpoints)
 │   │   ├── routes/
-│   │   │   ├── events.py           # Stream ingestion + feed endpoints
-│   │   │   ├── recommendations.py  # Placement endpoints (taxon/product/basket)  ← NEW
+│   │   │   ├── events.py           # /events, /consumer-events, /infer, /feed, /feed/push, /logs/*
+│   │   │   ├── recommendations.py  # /recommendations/taxon, /product, /basket
+│   │   │   ├── dashboard.py        # /dashboard (HTML), /api/v1/metrics (JSON)
 │   │   │   └── health.py           # /health, /catalog/status, /catalog/sync
-│   │   └── middleware/             # (reserved for auth / rate limiting)
+│   │   └── middleware/
+│   │       ├── auth.py             # API key auth + per-tier rate limiting
+│   │       └── __init__.py
 │   │
 │   └── module/
 │       ├── intent_scorer.py        # Event weights, time-decay formula
@@ -501,7 +504,7 @@ marketplace-stream-data-recommendation-engine/
 │       ├── catalog_sync.py         # PG fetch, field normalization, TF-IDF build,
 │       │                           #   taxon maps, scheduled re-sync
 │       ├── content_based.py        # CBF: TF-IDF cosine similarity search
-│       ├── collaborative.py        # CF: item-based co-interaction scoring  ← NEW
+│       ├── collaborative.py        # CF: item-based co-interaction scoring
 │       ├── hybrid_ranker.py        # RRF merge, context re-rankers, recommend(),
 │       │                           #   recommend_multi_taxon()
 │       ├── settings.py             # Oracle credentials via pydantic-settings / .env
@@ -510,7 +513,8 @@ marketplace-stream-data-recommendation-engine/
 │       └── helper.py               # @timeit, @logging_timer decorators
 │
 ├── docs/
-│   └── API_GUIDE.md                # Comprehensive API integration guide  ← NEW
+│   ├── API_GUIDE.md                # Comprehensive API integration guide
+│   └── INTEGRATION_AND_TESTING_GUIDE.md  # cURL test suite, socat proxy setup
 │
 ├── notebooks/
 │   ├── test.ipynb                  # Data exploration + live API integration cells
@@ -543,6 +547,7 @@ All settings are in `config.py`. Override any value with the corresponding envir
 | `SYNC_INTERVAL_MINUTES` | — | `10` | Catalog re-sync interval |
 | `RECOMMENDATION_CACHE_TTL` | `TOKI_REC_CACHE_TTL` | `14400` | 4 hours |
 | `WORKERS` | `TOKI_WORKERS` | `24` | Gunicorn worker count |
+| `TOKI_API_KEYS` | `TOKI_API_KEYS` | — | Comma-separated `key:tier` pairs (see Auth) |
 | `MARKETPLACE_API_BASE_URL` | — | `http://10.21.60.94:9000/marketplace` | Shop feed push target |
 
 ### PostgreSQL credentials (`meta/pg.cred`)
@@ -570,30 +575,79 @@ oracle_port=1521
 ### Development (hot-reload)
 
 ```bash
-TOKI_ENV=staging uvicorn src.api.app:app --host 0.0.0.0 --port 8018 --reload
+TOKI_ENV=staging \
+TOKI_API_KEYS="toki-internal-key:internal,toki-standard-key:standard,toki-readonly-key:readonly" \
+uvicorn src.api.app:app --host 0.0.0.0 --port 8018 --reload
 ```
 
 ### Direct Python entry point
 
 ```bash
-python -m src.main
+TOKI_API_KEYS="toki-internal-key:internal" python -m src.main
 ```
 
 ### Production (Gunicorn + Uvicorn workers)
 
 ```bash
+TOKI_API_KEYS="toki-internal-key:internal,toki-standard-key:standard,toki-readonly-key:readonly" \
 gunicorn src.api.app:app \
   -k uvicorn.workers.UvicornWorker \
   -b 0.0.0.0:8018 \
   -w 4 \
-  --timeout 120
+  --timeout 30 \
+  --log-level warning
+```
+
+### Production daemon (current setup)
+
+Environment variables are sourced from `meta/marketplace.env`.
+
+```bash
+# 1. Load env vars
+set -a && source meta/marketplace.env && set +a
+
+# 2. Start (4 uvicorn workers, daemonised)
+gunicorn src.api.app:app \
+  -k uvicorn.workers.UvicornWorker \
+  -b 0.0.0.0:8018 \
+  -w 4 \
+  --timeout 30 \
+  --log-level warning \
+  --daemon
+```
+
+### Stop
+
+```bash
+kill $(pgrep -f 'gunicorn src.api.app:app' | head -1)
+```
+
+### Restart (one-liner)
+
+```bash
+kill $(pgrep -f 'gunicorn src.api.app:app' | head -1) && sleep 3 \
+  && set -a && source meta/marketplace.env && set +a \
+  && gunicorn src.api.app:app \
+     -k uvicorn.workers.UvicornWorker \
+     -b 0.0.0.0:8018 -w 4 \
+     --timeout 30 --log-level warning --daemon
 ```
 
 ### Verify
 
 ```bash
+# Health — no auth required
 curl http://localhost:8018/api/v1/health
-curl http://localhost:8018/docs         # Interactive Swagger UI
+
+# Catalog status — requires key
+curl http://localhost:8018/api/v1/catalog/status \
+  -H "X-API-Key: toki-readonly-key"
+
+# Live monitoring dashboard (browser)
+open http://localhost:8018/dashboard
+
+# Interactive Swagger UI
+open http://localhost:8018/docs
 ```
 
 ---
@@ -606,46 +660,32 @@ The image uses `continuumio/miniconda3`, installs Oracle Instant Client, and run
 
 ```bash
 # Build
-docker build -t toki-rec-engine:v4.1.0 .
+docker build -t toki-rec-engine:v4.2.0 .
 
 # Run with env file
 docker run --rm \
   --env-file=$HOME/envs/marketplace.env \
   -p 8018:8018 \
-  toki-rec-engine:v4.1.0
+  toki-rec-engine:v4.2.0
 ```
 
-### Dockerfile update needed
+### Dockerfile note
 
-The current `Dockerfile` runs `script.py`. To serve the API, change the final CMD:
+The current `Dockerfile` CMD runs `script.py`, which calls `src.main.main()` which launches uvicorn. For a production multi-worker image, override the CMD:
 
 ```dockerfile
-# Replace:
-CMD ["python3", "script.py"]
-
-# With:
 COPY config.py /myapp
-CMD ["gunicorn", "src.api.app:app", \
-     "-k", "uvicorn.workers.UvicornWorker", \
-     "-b", "0.0.0.0:8018", "-w", "4"]
-```
-
-Also add the new dependencies to `requirements.txt`:
-
-```
-fastapi
-uvicorn[standard]
-gunicorn
-scikit-learn
-numpy
-httpx
+CMD ["gunicorn", "src.api.app:app",
+     "-k", "uvicorn.workers.UvicornWorker",
+     "-b", "0.0.0.0:8018", "-w", "4",
+     "--timeout", "30", "--log-level", "warning"]
 ```
 
 ### Create Release (auto-build CI)
 
 ```bash
-git tag v4.1.0
-git push origin v4.1.0
+git tag v4.2.0
+git push origin v4.2.0
 ```
 
 ---
@@ -683,7 +723,7 @@ The public URL (`https://<random>.trycloudflare.com`) gives shop developers full
 
 - Runs automatically every 10 minutes in the background
 - Force a re-sync: `POST /api/v1/catalog/sync`
-- The TF-IDF matrix is rebuilt in-process (~2 sec for 4,121 products)
+- The TF-IDF matrix is rebuilt in-process (~3–4 sec for 4,215 products)
 
 ### Delivery log
 

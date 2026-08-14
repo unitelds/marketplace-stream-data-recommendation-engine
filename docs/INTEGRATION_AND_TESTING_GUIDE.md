@@ -53,7 +53,7 @@ Expected: `{"status": "ok", ...}`
 
 ## 2. Authentication
 
-Every `/api/v1/*` request (except `/api/v1/health`) requires an API key.
+Every `/api/v1/*` request requires an API key.\n\n**Exempt paths** (no key needed): `/api/v1/health`, `/api/v1/metrics`, `/dashboard`, `/docs`, `/redoc`, `/openapi.json`.
 
 ### Sending the key
 

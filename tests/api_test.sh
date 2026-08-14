@@ -232,6 +232,42 @@ BODY=$(echo "$RESP" | head -n -1)
 _check "POST /api/v1/infer" "$CODE"
 echo "$BODY" | python3 -m json.tool 2>/dev/null || echo "$BODY"
 
+# ── 11. Catalog status ────────────────────────────────────────────────────────
+echo ""
+echo "── 11. Catalog status ──"
+RESP=$(curl -s -w "\n%{http_code}" "$BASE/api/v1/catalog/status" \
+  -H "X-API-Key: $KEY")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | head -n -1)
+_check "GET /api/v1/catalog/status" "$CODE"
+echo "$BODY" | python3 -m json.tool 2>/dev/null || echo "$BODY"
+
+# ── 12. Manual catalog sync ───────────────────────────────────────────────────
+echo ""
+echo "── 12. Manual catalog sync ──"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/v1/catalog/sync" \
+  -H "X-API-Key: $KEY")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | head -n -1)
+_check "POST /api/v1/catalog/sync" "$CODE"
+echo "$BODY" | python3 -m json.tool 2>/dev/null || echo "$BODY"
+
+# ── 13. Auth guard — invalid key returns 401 ─────────────────────────────────
+echo ""
+echo "── 13. Auth guard ──"
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/v1/events" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: invalid-key" \
+  -d '{"events":[]}')
+CODE=$(echo "$RESP" | tail -1)
+if [ "$CODE" = "401" ]; then
+    echo "  [PASS] Invalid key rejected (HTTP 401)"
+    ((pass++)) || true
+else
+    echo "  [FAIL] Expected 401 for invalid key, got HTTP $CODE"
+    ((fail++)) || true
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "========================================"

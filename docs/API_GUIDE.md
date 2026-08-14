@@ -12,20 +12,25 @@
 4. [Event Ingestion Endpoints](#4-event-ingestion-endpoints)
    - [POST /api/v1/events](#post-apiv1events)
    - [POST /api/v1/consumer-events](#post-apiv1consumer-events)
-4. [UI Placement Recommendation Endpoints](#4-ui-placement-recommendation-endpoints)
+5. [UI Placement Recommendation Endpoints](#5-ui-placement-recommendation-endpoints)
    - [POST /api/v1/recommendations/taxon](#post-apiv1recommendationstaxon)
    - [POST /api/v1/recommendations/product](#post-apiv1recommendationsproduct)
    - [POST /api/v1/recommendations/basket](#post-apiv1recommendationsbasket)
-5. [Feed & Inference Endpoints](#5-feed--inference-endpoints)
+6. [Feed & Inference Endpoints](#6-feed--inference-endpoints)
    - [POST /api/v1/infer](#post-apiv1infer)
    - [POST /api/v1/feed](#post-apiv1feed)
    - [POST /api/v1/feed/push](#post-apiv1feedpush)
-6. [Health & Catalog Endpoints](#6-health--catalog-endpoints)
-7. [Recommendation Strategy Reference](#7-recommendation-strategy-reference)
-8. [Intent Score Reference](#8-intent-score-reference)
-9. [Integration Patterns by UI Area](#9-integration-patterns-by-ui-area)
-10. [Error Handling](#10-error-handling)
-11. [Performance Characteristics](#11-performance-characteristics)
+7. [Health & Catalog Endpoints](#7-health--catalog-endpoints)
+8. [Monitoring, Logs & Dashboard](#8-monitoring-logs--dashboard)
+   - [GET /api/v1/metrics](#get-apiv1metrics)
+   - [GET /api/v1/logs/ingest](#get-apiv1logsingest)
+   - [GET /api/v1/logs/push](#get-apiv1logspush)
+   - [GET /dashboard](#get-dashboard)
+9. [Recommendation Strategy Reference](#9-recommendation-strategy-reference)
+10. [Intent Score Reference](#10-intent-score-reference)
+11. [Integration Patterns by UI Area](#11-integration-patterns-by-ui-area)
+12. [Error Handling](#12-error-handling)
+13. [Performance Characteristics](#13-performance-characteristics)
 
 ---
 
@@ -53,7 +58,9 @@ All three are merged via **Reciprocal Rank Fusion (RRF)** with placement-tuned w
 
 ## 2. Authentication
 
-Every request to `/api/v1/*` must carry a valid API key (except `/api/v1/health`, `/docs`, `/redoc`, and `/openapi.json`).
+Every request to `/api/v1/*` must carry a valid API key.
+
+**Exempt paths** (no key required): `/api/v1/health`, `/api/v1/metrics`, `/dashboard`, `/docs`, `/redoc`, `/openapi.json`.
 
 ### Key tiers
 
@@ -65,23 +72,27 @@ Every request to `/api/v1/*` must carry a valid API key (except `/api/v1/health`
 
 Keys are configured on the server via the `TOKI_API_KEYS` environment variable:
 
-```
-TOKI_API_KEYS="your-key-1:internal,your-key-2:standard,your-key-3:readonly"
+```bash
+TOKI_API_KEYS="toki-internal-key:internal,toki-standard-key:standard,toki-readonly-key:readonly"
 ```
 
-A built-in key `dev-local-unsafe` (tier `internal`) is active in **non-production** environments only.
+A built-in key `dev-local-unsafe` (tier `internal`) is active in **non-production** environments only (`TOKI_ENV != production`).
 
 ### Passing the key
 
 **Option 1 — HTTP header (recommended)**
 
 ```bash
-
+curl -X POST http://<host>:8018/api/v1/events \
+  -H "X-API-Key: toki-internal-key" \
+  -H "Content-Type: application/json" \
+  -d '{ ... }'
+```
 
 **Option 2 — Query parameter**
 
 ```bash
-curl -X POST "http://<host>:8018/api/v1/events?api_key=your-api-key" \
+curl -X POST "http://<host>:8018/api/v1/events?api_key=toki-internal-key" \
   -H "Content-Type: application/json" \
   -d '{ ... }'
 ```
@@ -93,8 +104,8 @@ curl -X POST "http://<host>:8018/api/v1/events?api_key=your-api-key" \
 ```python
 import requests
 
-API_KEY = "your-api-key"
-BASE_URL = "http://<host>:8018"
+API_KEY = "toki-standard-key"  # use toki-internal-key for backend pipelines
+BASE_URL = "http://10.22.4.13:8018"
 
 resp = requests.post(
     f"{BASE_URL}/api/v1/recommendations/taxon",
@@ -112,10 +123,10 @@ print(resp.json())
 **JavaScript (fetch)**
 
 ```js
-const resp = await fetch("http://<host>:8018/api/v1/recommendations/taxon", {
+const resp = await fetch("http://10.22.4.13:8018/api/v1/recommendations/taxon", {
   method: "POST",
   headers: {
-    "X-API-Key": "your-api-key",
+    "X-API-Key": "toki-standard-key",
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
@@ -141,7 +152,8 @@ const data = await resp.json();
 ### Step 1 — Send an engagement event
 
 ```bash
-curl -X POST http://localhost:8018/api/v1/events \
+curl -X POST http://10.22.4.13:8018/api/v1/events \
+  -H "X-API-Key: toki-internal-key" \
   -H "Content-Type: application/json" \
   -d '{
     "events": [{
@@ -152,7 +164,7 @@ curl -X POST http://localhost:8018/api/v1/events \
         "productid": "6989774f3516dac1b3e979ee",
         "action": "view"
       },
-      "user_agent": "Mozilla/5.0 (iPhone; ...)"
+      "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X)"
     }]
   }'
 ```
@@ -160,7 +172,8 @@ curl -X POST http://localhost:8018/api/v1/events \
 ### Step 2 — Get taxon page recommendations
 
 ```bash
-curl -X POST http://localhost:8018/api/v1/recommendations/taxon \
+curl -X POST http://10.22.4.13:8018/api/v1/recommendations/taxon \
+  -H "X-API-Key: toki-standard-key" \
   -H "Content-Type: application/json" \
   -d '{
     "account_id": "6a5e47214aeec353171ccaa0",
@@ -172,13 +185,17 @@ curl -X POST http://localhost:8018/api/v1/recommendations/taxon \
 ### Step 3 — Check system status
 
 ```bash
-curl http://localhost:8018/api/v1/health
-curl http://localhost:8018/api/v1/catalog/status
+# Health check — no auth required
+curl http://10.22.4.13:8018/api/v1/health
+
+# Catalog diagnostics — requires key
+curl http://10.22.4.13:8018/api/v1/catalog/status \
+  -H "X-API-Key: toki-readonly-key"
 ```
 
 ---
 
-## 3. Event Ingestion Endpoints
+## 4. Event Ingestion Endpoints
 
 ### `POST /api/v1/events`
 
@@ -289,7 +306,7 @@ Response schema is identical to `/events`.
 
 ---
 
-## 4. UI Placement Recommendation Endpoints
+## 5. UI Placement Recommendation Endpoints
 
 These three endpoints map directly to the three recommendation panels on the shop frontend. Each uses a distinct blend of CBF + CF + popularity pipelines tuned for its specific placement context.
 
@@ -499,7 +516,7 @@ These three endpoints map directly to the three recommendation panels on the sho
 
 ---
 
-## 5. Feed & Inference Endpoints
+## 6. Feed & Inference Endpoints
 
 ### `POST /api/v1/infer`
 
@@ -641,7 +658,7 @@ The `context` object seeds the ranker with explicit basket and device state, ove
 
 ---
 
-## 6. Health & Catalog Endpoints
+## 7. Health & Catalog Endpoints
 
 ### `GET /api/v1/health`
 
@@ -665,10 +682,10 @@ Full diagnostic snapshot of the feature store and catalog state.
 ```json
 {
   "catalog_ready": true,
-  "catalog_size": 4511,
-  "catalog_synced_at": "2026-07-31T09:23:26.745Z",
-  "catalog_age_minutes": 9.6,
-  "tfidf_shape": [4511, 30000],
+  "catalog_size": 4215,
+  "catalog_synced_at": "2026-08-14T07:23:26.745Z",
+  "catalog_age_minutes": 3.2,
+  "tfidf_shape": [4215, 30000],
   "taxon_label_map_size": 165,
   "taxon_name_map_size": 79,
   "taxons_with_products": 77,
@@ -694,7 +711,148 @@ Trigger a forced catalog re-sync from PostgreSQL (runs automatically every 10 mi
 
 ---
 
-## 7. Recommendation Strategy Reference
+## 8. Monitoring, Logs & Dashboard
+
+All three paths are **exempt from authentication** (no API key required).
+
+---
+
+### `GET /api/v1/metrics`
+
+Live aggregated metrics snapshot across all gunicorn workers.
+
+```bash
+curl http://10.22.4.13:8018/api/v1/metrics
+```
+
+**Response shape:**
+
+```json
+{
+  "uptime_seconds": 3842,
+  "delivery_queue_depth": 0,
+  "ingestion": {
+    "events_processed": 12480,
+    "consumer_events_processed": 8340,
+    "batches": 94,
+    "consumer_batches": 62,
+    "events_failed": 3,
+    "infer_timeouts": 0,
+    "by_activity": {
+      "product_click": 5120,
+      "order-events": 430,
+      "cart-events": 1890
+    }
+  },
+  "recommendations": {
+    "served_total": 98400,
+    "by_strategy": { "multi_taxon_hybrid": 6200, "hybrid": 910 },
+    "by_device":   { "mobile": 5840, "desktop": 910 },
+    "by_endpoint": { "feed": 6200, "events": 910 }
+  },
+  "timeseries": [
+    { "events": 12, "recs": 88 }
+  ],
+  "system": {
+    "catalog_ready": true,
+    "catalog_size": 4215,
+    "catalog_age_minutes": 3.2,
+    "active_sessions": 41,
+    "tracked_users": 162,
+    "taxons_with_products": 77
+  }
+}
+```
+
+---
+
+### `GET /api/v1/logs/ingest`
+
+Returns the most recent ingest-batch log entries (one entry per `POST /events` or `/consumer-events` call).
+
+```bash
+curl "http://10.22.4.13:8018/api/v1/logs/ingest?limit=10"
+```
+
+| Query param | Default | Description |
+|---|---|---|
+| `limit` | `50` | Max entries to return (newest first) |
+
+**Response:**
+
+```json
+{
+  "entries": [
+    {
+      "ts": "2026-08-14T07:18:43.210+00:00",
+      "source": "consumer-events",
+      "processed": 42,
+      "failed": 0,
+      "users": ["66fbc5824e022311128232ae", "...up to 20"],
+      "event_types": { "product_click": 38, "taxon_click": 4 }
+    }
+  ],
+  "total_stored": 94
+}
+```
+
+`source` is `"events"` (customer_activities format) or `"consumer-events"` (Oracle format).
+
+---
+
+### `GET /api/v1/logs/push`
+
+Returns the most recent marketplace push log entries (one entry per `/feed` or `/feed/push` call that triggered a shop push).
+
+```bash
+curl "http://10.22.4.13:8018/api/v1/logs/push?limit=10"
+```
+
+**Response:**
+
+```json
+{
+  "entries": [
+    {
+      "ts": "2026-08-14T07:19:01.334+00:00",
+      "account_id": "66fbc5824e022311128232ae",
+      "products_count": 45,
+      "push_url": "http://10.21.60.94:9000/marketplace",
+      "push_status": "ok",
+      "push_error": null,
+      "strategy": "multi_taxon_hybrid"
+    }
+  ],
+  "total_stored": 62
+}
+```
+
+`push_status` values: `"ok"` | `"failed"` | `"skipped"` (accountId not a valid ObjectId).
+
+---
+
+### `GET /dashboard`
+
+Self-contained live HTML monitoring dashboard. No auth required. Opens directly in a browser.
+
+```
+http://10.22.4.13:8018/dashboard
+```
+
+Contains:
+- **Stat cards** — Events ingested, Consumer events, Recs served, Events failed (parse/apply errors), Infer timeouts, Uptime
+- **Time-series charts** — Events/10 s and Recs/10 s (last 10 minutes)
+- **Breakdown tables** — by activity type, recommendation strategy, device, endpoint
+- **Latest ingested stream data** — last 10 ingest batches as a table (time, source, +ok, failed, users, event types)
+- **Latest data pushed to marketplace** — last 10 push records (time, account, products, strategy, status, error)
+- **Data Schema Reference** — field-by-field documentation for all four data shapes (stream event, consumer event, response formats, marketplace push payload)
+- **Live API Testing** — three interactive test panels (feed by user ID, consumer event ingest, product similarity)
+
+Refreshes automatically every 5 seconds.
+
+---
+
+## 9. Recommendation Strategy Reference
 
 The `strategy` field in every response indicates how the recommendations were generated.
 
@@ -716,7 +874,7 @@ The `strategy` field in every response indicates how the recommendations were ge
 
 ---
 
-## 8. Intent Score Reference
+## 10. Intent Score Reference
 
 The `intent_score` in responses reflects cumulative session buying intent. Each event contributes a time-decayed weight:
 
@@ -743,7 +901,7 @@ order-events      → +5.0  (intent = 14.0)
 
 ---
 
-## 9. Integration Patterns by UI Area
+## 11. Integration Patterns by UI Area
 
 ### Pattern A — Taxon page (category listing)
 
@@ -828,7 +986,7 @@ User opens homepage (or personalised section)
 
 ---
 
-## 10. Error Handling
+## 12. Error Handling
 
 All endpoints return standard HTTP status codes:
 
@@ -844,7 +1002,7 @@ When the catalog is not yet ready (e.g. first few seconds after startup), recomm
 
 ---
 
-## 11. Performance Characteristics
+## 13. Performance Characteristics
 
 | Operation | Typical latency | Notes |
 |---|---|---|

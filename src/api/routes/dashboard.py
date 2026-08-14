@@ -194,24 +194,40 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ── Live Logs ──────────────────────────────────────────────────────────── -->
+  <!-- ── Stream & Marketplace Data Tables ─────────────────────────────────── -->
   <div class="row g-2 mt-2">
     <div class="col-md-6">
-      <div class="card p-3" style="max-height:260px;overflow:hidden;display:flex;flex-direction:column">
-        <div class="d-flex justify-content-between align-items-center mb-1">
-          <span class="stat-lbl">Ingest Log</span>
+      <div class="card p-3">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <span class="stat-lbl">Latest Ingested Stream Data <span class="text-secondary fw-normal">(last 10 batches)</span></span>
           <span id="ingest-total" class="small text-secondary"></span>
         </div>
-        <div id="log-ingest" style="overflow-y:auto;flex:1;font-family:monospace;font-size:.7rem;color:#8babbf;line-height:1.55"></div>
+        <div style="overflow-x:auto">
+          <table class="table table-sm mb-0">
+            <thead><tr style="color:#6b8ba4;font-size:.7rem;border-bottom:1px solid #1f3048">
+              <th>Time (UTC)</th><th>Source</th><th class="text-end">+OK</th>
+              <th class="text-end">Failed</th><th class="text-end">Users</th><th>Event Types</th>
+            </tr></thead>
+            <tbody id="log-ingest"></tbody>
+          </table>
+        </div>
       </div>
     </div>
     <div class="col-md-6">
-      <div class="card p-3" style="max-height:260px;overflow:hidden;display:flex;flex-direction:column">
-        <div class="d-flex justify-content-between align-items-center mb-1">
-          <span class="stat-lbl">Push Log &mdash; Marketplace</span>
+      <div class="card p-3">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <span class="stat-lbl">Latest Data Pushed to Marketplace <span class="text-secondary fw-normal">(last 10)</span></span>
           <span id="push-total" class="small text-secondary"></span>
         </div>
-        <div id="log-push" style="overflow-y:auto;flex:1;font-family:monospace;font-size:.7rem;color:#8babbf;line-height:1.55"></div>
+        <div style="overflow-x:auto">
+          <table class="table table-sm mb-0">
+            <thead><tr style="color:#6b8ba4;font-size:.7rem;border-bottom:1px solid #1f3048">
+              <th>Time (UTC)</th><th>Account ID</th><th class="text-end">Products</th>
+              <th>Strategy</th><th>Status</th><th>Error</th>
+            </tr></thead>
+            <tbody id="log-push"></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
@@ -306,6 +322,120 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
           <button onclick="runProductTest()" class="btn btn-sm btn-success w-100 mb-2">Get Similar &#9654;</button>
           <div id="t3-result" style="display:none"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Data Schema Reference ──────────────────────────────────────────────── -->
+  <div class="mt-4">
+    <div class="fw-bold text-white mb-2" style="font-size:.9rem">Data Schema Reference</div>
+    <div class="row g-2">
+
+      <!-- Schema 1: Stream Event -->
+      <div class="col-lg-3">
+        <div class="card p-3 h-100">
+          <div class="stat-lbl mb-1">&#9312; Stream Event &mdash; <code style="color:#38bdf8;font-size:.72rem">POST /api/v1/events</code></div>
+          <p class="small text-secondary mb-2" style="font-size:.75rem">Each object in the <code>events[]</code> batch (customer_activities format). Batch max&nbsp;500.</p>
+          <table class="table table-sm mb-2">
+            <thead><tr style="color:#6b8ba4;font-size:.68rem"><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+            <tbody style="font-size:.72rem">
+              <tr><td><code>account_id</code></td><td>string</td><td class="text-secondary"><b>Required.</b> User identifier</td></tr>
+              <tr><td><code>activity_name</code></td><td>string</td><td class="text-secondary"><b>Required.</b> See types &darr;</td></tr>
+              <tr><td><code>activity_data</code></td><td>dict|str</td><td class="text-secondary">JSON payload; shape varies by type</td></tr>
+              <tr><td><code>event_id</code></td><td>string?</td><td class="text-secondary">Optional dedup ID</td></tr>
+              <tr><td><code>session_id</code></td><td>string?</td><td class="text-secondary">Browser session</td></tr>
+              <tr><td><code>timestamp</code></td><td>ISO&nbsp;8601?</td><td class="text-secondary">Defaults to server now</td></tr>
+              <tr><td><code>p_date</code></td><td>string?</td><td class="text-secondary">Partition date YYYYMMDD</td></tr>
+            </tbody>
+          </table>
+          <div style="font-size:.7rem;color:#6b8ba4">
+            <span style="color:#94a3b8">activity_name values:</span><br>
+            <code>product_click</code> &middot; <code>taxon_click</code> &middot; <code>view_product</code><br>
+            <code>order-events</code> &middot; <code>cart-events</code><br>
+            <code>wishlist-events</code> &middot; <code>limit-events</code>
+          </div>
+        </div>
+      </div>
+
+      <!-- Schema 2: Consumer Event -->
+      <div class="col-lg-3">
+        <div class="card p-3 h-100">
+          <div class="stat-lbl mb-1">&#9313; Consumer Event &mdash; <code style="color:#a78bfa;font-size:.72rem">POST /api/v1/consumer-events</code></div>
+          <p class="small text-secondary mb-2" style="font-size:.75rem">Oracle <code>consumer_events</code> table row format. Field names are Oracle column aliases.</p>
+          <table class="table table-sm mb-2">
+            <thead><tr style="color:#6b8ba4;font-size:.68rem"><th>Field (alias)</th><th>Type</th><th>Notes</th></tr></thead>
+            <tbody style="font-size:.72rem">
+              <tr><td><code>ACCOUNTID</code></td><td>string</td><td class="text-secondary"><b>Required.</b> User ID</td></tr>
+              <tr><td><code>EVENTNAME</code></td><td>string</td><td class="text-secondary">product_click | taxon_click</td></tr>
+              <tr><td><code>EVENTVALUE</code></td><td>dict|str</td><td class="text-secondary">See examples &darr;</td></tr>
+              <tr><td><code>SESSIONID</code></td><td>string?</td><td class="text-secondary">Browser session ID</td></tr>
+              <tr><td><code>USERAGENT</code></td><td>string?</td><td class="text-secondary">Device detection</td></tr>
+              <tr><td><code>TIMESTAMP_</code></td><td>ISO&nbsp;8601?</td><td class="text-secondary">Event timestamp</td></tr>
+              <tr><td><code>ID_</code></td><td>string?</td><td class="text-secondary">Oracle row ID</td></tr>
+              <tr><td><code>P_DATE</code></td><td>string?</td><td class="text-secondary">Partition date</td></tr>
+            </tbody>
+          </table>
+          <div style="font-size:.7rem;color:#6b8ba4">
+            <span style="color:#94a3b8">EVENTVALUE examples:</span><br>
+            <code>product_click</code>: <code>{&quot;productIds&quot;:[&quot;&hellip;&quot;],&quot;taxon&quot;:{&quot;label&quot;:&quot;&hellip;&quot;}}</code><br>
+            <code>taxon_click</code>: <code>{&quot;taxon&quot;:{&quot;label&quot;:&quot;&hellip;&quot;}}</code>
+          </div>
+        </div>
+      </div>
+
+      <!-- Schema 3: Response Formats -->
+      <div class="col-lg-3">
+        <div class="card p-3 h-100">
+          <div class="stat-lbl mb-1">&#9314; Response Formats</div>
+          <p class="small text-secondary mb-1" style="font-size:.75rem"><b>EventsResponse</b> &mdash; <code style="color:#6b8ba4">/events</code>, <code style="color:#6b8ba4">/consumer-events</code></p>
+          <table class="table table-sm mb-3">
+            <tbody style="font-size:.72rem">
+              <tr><td><code>status</code></td><td class="text-secondary">&quot;accepted&quot;</td></tr>
+              <tr><td><code>processed</code></td><td class="text-secondary">int &mdash; events stored</td></tr>
+              <tr><td><code>failed</code></td><td class="text-secondary">int &mdash; parse / apply errors</td></tr>
+              <tr><td><code>recommendations[]</code></td><td class="text-secondary">inline recs (if any)</td></tr>
+            </tbody>
+          </table>
+          <p class="small text-secondary mb-1" style="font-size:.75rem"><b>MultiTaxonResponse</b> &mdash; <code style="color:#6b8ba4">/feed</code></p>
+          <table class="table table-sm mb-0">
+            <tbody style="font-size:.72rem">
+              <tr><td><code>id</code></td><td class="text-secondary">account_id echoed back</td></tr>
+              <tr><td><code>taxon_feeds[]</code></td><td class="text-secondary">per-taxon rec lists</td></tr>
+              <tr><td><code>taxon_feeds[].taxon_id</code></td><td class="text-secondary">taxon slug</td></tr>
+              <tr><td><code>taxon_feeds[].recommendations</code></td><td class="text-secondary">ranked product IDs</td></tr>
+              <tr><td><code>total_products</code></td><td class="text-secondary">int total across all taxons</td></tr>
+              <tr><td><code>strategy</code></td><td class="text-secondary">multi_taxon_hybrid etc.</td></tr>
+              <tr><td><code>intent_score</code></td><td class="text-secondary">0.0&ndash;1.0 engagement depth</td></tr>
+              <tr><td><code>served_at</code></td><td class="text-secondary">ISO 8601 UTC timestamp</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Schema 4: Marketplace Push Payload -->
+      <div class="col-lg-3">
+        <div class="card p-3 h-100">
+          <div class="stat-lbl mb-1">&#9315; Marketplace Push Payload</div>
+          <p class="small text-secondary mb-2" style="font-size:.75rem">Shape sent to the shop&rsquo;s feed endpoint on every <code>/feed</code> call (background task, fire-and-forget).</p>
+          <pre style="background:#0d1b2a;border:1px solid #1f3048;border-radius:6px;padding:8px;font-size:.69rem;color:#94a3b8;overflow-x:auto;white-space:pre">{
+  &quot;accountId&quot;: &quot;&lt;24-char ObjectId&gt;&quot;,
+  &quot;products&quot;: [
+    {
+      &quot;productId&quot;: &quot;&lt;product ObjectId&gt;&quot;,
+      &quot;taxonId&quot;:   &quot;&lt;taxon slug&gt;&quot;
+    }
+  ]
+}</pre>
+          <table class="table table-sm mt-2 mb-2">
+            <tbody style="font-size:.72rem">
+              <tr><td><code>accountId</code></td><td class="text-secondary">MongoDB ObjectId (24 hex chars required)</td></tr>
+              <tr><td><code>products[].productId</code></td><td class="text-secondary">Ranked product ID</td></tr>
+              <tr><td><code>products[].taxonId</code></td><td class="text-secondary">Taxon/category slug</td></tr>
+            </tbody>
+          </table>
+          <div style="font-size:.7rem;color:#6b8ba4">Push status visible in the table above. <code>skipped</code> = accountId not a valid ObjectId. <code>failed</code> = shop endpoint unreachable.</div>
         </div>
       </div>
 
@@ -463,38 +593,49 @@ function fmtTs(iso) {
 
 function renderIngestLog(data) {
   $("ingest-total").textContent = `${data.total_stored} stored`;
-  const rows = (data.entries || []).map(e => {
+  const rows = (data.entries || []).slice(0, 10).map(e => {
     const types = Object.entries(e.event_types || {}).map(([k, v]) => `${k}:${v}`).join(", ");
     const users = (e.users || []).length;
-    const ok = e.failed === 0;
-    const color = ok ? "#4ade80" : "#f87171";
-    return `<div style="padding:1px 0;border-bottom:1px solid #1a2d44">` +
-      `<span style="color:#6b8ba4">${fmtTs(e.ts)}</span> ` +
-      `<span style="color:#38bdf8">[${e.source}]</span> ` +
-      `<span style="color:${color}">+${e.processed}</span>` +
-      (e.failed ? `<span style="color:#f87171"> fail:${e.failed}</span>` : "") +
-      ` users:${users}` +
-      (types ? ` <span style="color:#94a3b8">${types}</span>` : "") +
-      `</div>`;
+    const srcColor = e.source === "events" ? "#38bdf8" : "#a78bfa";
+    const failCell = e.failed
+      ? `<td class="text-end" style="color:#f87171">${e.failed}</td>`
+      : `<td class="text-end" style="color:#6b8ba4">0</td>`;
+    return `<tr>
+      <td style="white-space:nowrap;color:#6b8ba4;font-size:.7rem">${fmtTs(e.ts)}</td>
+      <td><span style="color:${srcColor}">${e.source || "\u2014"}</span></td>
+      <td class="text-end" style="color:#4ade80">${e.processed ?? 0}</td>
+      ${failCell}
+      <td class="text-end" style="color:#e2e8f0">${users}</td>
+      <td style="color:#94a3b8;font-size:.7rem">${types || "\u2014"}</td>
+    </tr>`;
   });
-  $("log-ingest").innerHTML = rows.join("") || '<span style="color:#6b8ba4">No ingest batches yet</span>';
+  $("log-ingest").innerHTML = rows.join("") ||
+    '<tr><td colspan="6" class="text-center text-secondary py-2">No ingest batches yet</td></tr>';
 }
 
 function renderPushLog(data) {
   $("push-total").textContent = `${data.total_stored} stored`;
-  const rows = (data.entries || []).map(e => {
+  const rows = (data.entries || []).slice(0, 10).map(e => {
     const ok = e.push_status === "ok";
-    const color = ok ? "#4ade80" : "#f87171";
-    return `<div style="padding:1px 0;border-bottom:1px solid #1a2d44">` +
-      `<span style="color:#6b8ba4">${fmtTs(e.ts)}</span> ` +
-      `<span style="color:${color}">[${e.push_status}]</span> ` +
-      `<span style="color:#e2e8f0">${e.account_id || "—"}</span> ` +
-      `products:${e.products_count}` +
-      (e.strategy ? ` <span style="color:#94a3b8">${e.strategy}</span>` : "") +
-      (e.push_error ? ` <span style="color:#f87171" title="${e.push_error}">⚠ err</span>` : "") +
-      `</div>`;
+    const skip = e.push_status === "skipped";
+    const statusColor = ok ? "#4ade80" : (skip ? "#fbbf24" : "#f87171");
+    const acct = e.account_id
+      ? `<span title="${e.account_id}" style="font-family:monospace">${e.account_id.slice(0, 10)}&hellip;</span>`
+      : "\u2014";
+    const errText = e.push_error
+      ? `<span title="${e.push_error}" style="color:#f87171;cursor:help">${e.push_error.slice(0, 28)}&hellip;</span>`
+      : "";
+    return `<tr>
+      <td style="white-space:nowrap;color:#6b8ba4;font-size:.7rem">${fmtTs(e.ts)}</td>
+      <td style="font-size:.72rem;color:#e2e8f0">${acct}</td>
+      <td class="text-end" style="color:#38bdf8">${e.products_count ?? 0}</td>
+      <td style="color:#94a3b8">${e.strategy || "\u2014"}</td>
+      <td><span style="color:${statusColor}">${e.push_status || "\u2014"}</span></td>
+      <td style="font-size:.7rem">${errText}</td>
+    </tr>`;
   });
-  $("log-push").innerHTML = rows.join("") || '<span style="color:#6b8ba4">No pushes yet</span>';
+  $("log-push").innerHTML = rows.join("") ||
+    '<tr><td colspan="6" class="text-center text-secondary py-2">No pushes yet</td></tr>';
 }
 
 // ── Live test panel ─────────────────────────────────────────────────────────
