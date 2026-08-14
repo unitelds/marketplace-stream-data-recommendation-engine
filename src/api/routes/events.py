@@ -711,23 +711,30 @@ def _bg_push_feed_for_user(account_id: str) -> None:
         return
     result = recommend_multi_taxon(account_id, top_taxons=3, top_n_per_taxon=10)
     taxon_feeds = [TaxonFeedItem(**tf) for tf in result.get("taxon_feeds", [])]
+    strategy = result.get("strategy", "")
     if not taxon_feeds:
-        # cold-start: no interaction history yet — log so the dashboard shows it
+        # catalog_not_ready is the only legitimate empty-feed case
+        reason = (
+            "catalog not ready — retry after sync"
+            if strategy == "catalog_not_ready"
+            else f"no products returned (strategy={strategy!r})"
+        )
         _write_log(
             _PUSH_PFX,
             {
                 "ts": ts,
                 "account_id": account_id,
                 "products_count": 0,
-                "strategy": result.get("strategy", ""),
+                "strategy": strategy,
                 "push_url": None,
                 "push_status": "skipped",
-                "push_error": "empty feed — no interaction history yet (cold start)",
+                "push_error": reason,
             },
         )
-        logger.debug(f"Push skipped — cold start, no feed for {account_id}")
+        logger.debug(f"Push skipped [{account_id}] — {reason}")
         return
-    _auto_push_feed(account_id, taxon_feeds, result.get("strategy", ""))
+    # cold-start users get hash-rotated popular products (strategy="popular"); push those too
+    _auto_push_feed(account_id, taxon_feeds, strategy)
 
 
 @router.post(
