@@ -159,6 +159,16 @@ class FeatureStore:
         positive = {pid: s for pid, s in scores.items() if s > 0}
         return sorted(positive, key=positive.__getitem__, reverse=True)[:top_n]
 
+    def get_top_users(self, top_n: int = 1000) -> list[str]:
+        """Return the top N most active users sorted by cumulative interaction score."""
+        if not self._user_item_scores:
+            return []
+        totals = {
+            uid: sum(s for s in sc.values() if s > 0)
+            for uid, sc in self._user_item_scores.items()
+        }
+        return sorted(totals, key=totals.__getitem__, reverse=True)[:top_n]
+
     def get_user_score_for_product(self, account_id: str, product_id: str) -> float:
         return self._user_item_scores.get(account_id, {}).get(product_id, 0.0)
 

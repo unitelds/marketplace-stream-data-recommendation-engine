@@ -19,6 +19,7 @@ from typing import Optional
 
 from loguru import logger
 
+import src.module.cold_start as cold_start
 from src.module.content_based import get_similar_products, get_taxon_products
 from src.module.feature_store import store
 from src.module.intent_scorer import PRICE_RANGE_ORDINAL
@@ -188,6 +189,12 @@ def recommend(
     # ── Step 1: seed products ─────────────────────────────────────────────────
     seed_products = store.get_user_top_products(account_id, top_n=10)
     strategy = "popular"
+
+    # Cold start: use former rec engine seeds from cache (populated by placement endpoints)
+    if not seed_products:
+        seed_products = cold_start.read_cache(account_id, top_n=10)
+        if seed_products:
+            strategy = "cold_start_seed"
 
     # ── Step 2: CBF candidates ────────────────────────────────────────────────
     cbf_candidates: list[tuple[str, float]] = []

@@ -80,6 +80,9 @@ BATCH_UPDATE_INTERVAL = 180
 MAX_CACHE_AGE = 86400
 ENABLE_SCHEDULED_SYNC = True
 SYNC_INTERVAL_MINUTES = 10
+ORACLE_POLL_INTERVAL_SECONDS = int(
+    os.getenv("TOKI_ORACLE_POLL_INTERVAL", 60)
+)  # 0 = disabled
 BATCH_SIZE = 100  # doubled: 32-core server has headroom
 MAX_CONCURRENT_DB_OPERATIONS = (
     12  # aligned to actual pool capacity (pool_size+max_overflow=15)
@@ -206,10 +209,64 @@ SCORE_WEIGHTS = {
 }
 
 # ─────────────────────────────────────────────────────────
-# HANDSET FEED — per-user recommendations via external API
+# TOKI SHOP FEED — pull pre-computed taxon recs per user
+# GET {TOKI_SHOP_FEED_URL}/{account_id} → {"products":[{"productId":"...","taxonId":"..."}]}
+# Used exclusively by the taxon placement endpoint; all other placements use the core engine.
 # ─────────────────────────────────────────────────────────
-MARKETPLACE_API_BASE_URL = "https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation"  # {base}/{user_id}
-MARKETPLACE_API_TIMEOUT = 2  # seconds — fall back to catalogue scoring on timeout
+TOKI_SHOP_FEED_URL = os.getenv(
+    "TOKI_SHOP_FEED_URL", "http://10.21.60.94:9000/marketplace"
+)
+TOKI_SHOP_FEED_TIMEOUT = float(
+    os.getenv("TOKI_SHOP_FEED_TIMEOUT", 1.0)
+)  # must be fast — sits on taxon page critical path
+TOKI_SHOP_FEED_CACHE_TTL = int(
+    os.getenv("TOKI_SHOP_FEED_CACHE_TTL", 120)
+)  # seconds — feed changes slowly
+TOKI_SHOP_FEED_CACHE_SIZE = int(
+    os.getenv("TOKI_SHOP_FEED_CACHE_SIZE", 20000)
+)  # max cached accounts
+
+# ─────────────────────────────────────────────────────────
+# FORMER REC ENGINE — cold-start bridge (all placements)
+# GET {FORMER_REC_ENGINE_URL}/api/recommendations/{user_id}
+# Used as seed products when the core engine has no history for a user.
+# Async fetch on placement endpoints; sync cache-read on thread-pool path.
+# ─────────────────────────────────────────────────────────
+FORMER_REC_ENGINE_URL = os.getenv("FORMER_REC_ENGINE_URL", "http://10.21.60.94:8018")
+FORMER_REC_ENGINE_TIMEOUT = float(
+    os.getenv("FORMER_REC_ENGINE_TIMEOUT", 0.5)
+)  # sub-second — must not block critical path
+FORMER_REC_ENGINE_CACHE_TTL = int(
+    os.getenv("FORMER_REC_ENGINE_CACHE_TTL", 600)
+)  # 10 min
+FORMER_REC_ENGINE_CACHE_SIZE = int(os.getenv("FORMER_REC_ENGINE_CACHE_SIZE", 50000))
+
+# ─────────────────────────────────────────────────────────
+# MARKETPLACE PUSH — recommendation delivery to the shop API
+# Staging:    https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation
+# Production: http://10.21.60.94:9000/marketplace    (set TOKI_MARKETPLACE_PUSH_URL)
+# Override any time with TOKI_MARKETPLACE_PUSH_URL env var.
+# ─────────────────────────────────────────────────────────
+_PUSH_URL_STAGING = "https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation"
+_PUSH_URL_PRODUCTION = "http://10.21.60.94:9000/marketplace"
+MARKETPLACE_API_BASE_URL = os.getenv(
+    "TOKI_MARKETPLACE_PUSH_URL",
+    _PUSH_URL_PRODUCTION if ENVIRONMENT == "production" else _PUSH_URL_STAGING,
+)
+MARKETPLACE_API_TIMEOUT = int(os.getenv("TOKI_MARKETPLACE_PUSH_TIMEOUT", 3))
+
+# ─────────────────────────────────────────────────────────
+# SCHEDULED TOP-USERS PUSH — every PUSH_TOP_USERS_INTERVAL_SECONDS
+# Pushes personalized feeds for the top PUSH_TOP_USERS_COUNT most active users.
+# Only ONE gunicorn worker runs the loop (file-lock coordination).
+# Disable by setting TOKI_PUSH_ENABLED=false.
+# ─────────────────────────────────────────────────────────
+PUSH_ENABLED = os.getenv("TOKI_PUSH_ENABLED", "true").lower() != "false"
+PUSH_TOP_USERS_COUNT = int(os.getenv("TOKI_PUSH_TOP_USERS", 1000))
+PUSH_TOP_USERS_INTERVAL_SECONDS = int(os.getenv("TOKI_PUSH_INTERVAL", 600))  # 10 min
+PUSH_TOP_USERS_BATCH_SIZE = int(
+    os.getenv("TOKI_PUSH_BATCH_SIZE", 50)
+)  # concurrent per wave
 
 HANDSET_FEED_TABLE = "tmp_marketplace_handset_feed"  # retained for reference
 HANDSET_FEED_MAP = {

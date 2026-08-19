@@ -205,6 +205,46 @@ _INGEST_PFX = "toki_ingest_log_"
 _PUSH_PFX = "toki_push_log_"
 _LOG_MAX_LINES = 600  # rotate file above this many lines
 
+_EVENT_LOG_DIR = "logs"
+_EVENT_LOG_PFX = "toki_event_log_"
+_EVENT_LOG_MAX_LINES = 400  # keep last N lines per worker file
+
+
+def _write_event_log(entry: dict) -> None:
+    """Append one normalised event record to logs/toki_event_log_{pid}.jsonl."""
+    import os as _os
+
+    path = f"{_EVENT_LOG_DIR}/{_EVENT_LOG_PFX}{_os.getpid()}.jsonl"
+    try:
+        _os.makedirs(_EVENT_LOG_DIR, exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(_logjson.dumps(entry, ensure_ascii=False) + "\n")
+        if _os.path.getsize(path) > 160_000:
+            with open(path) as fh:
+                lines = fh.readlines()
+            with open(path, "w") as fh:
+                fh.writelines(lines[-_EVENT_LOG_MAX_LINES:])
+    except Exception:
+        pass
+
+
+def _read_event_logs(limit: int) -> tuple[list[dict], int]:
+    entries: list[dict] = []
+    for path in _glob.glob(f"{_EVENT_LOG_DIR}/{_EVENT_LOG_PFX}*.jsonl"):
+        try:
+            with open(path) as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if raw:
+                        try:
+                            entries.append(_logjson.loads(raw))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    entries.sort(key=lambda x: x.get("ts", ""), reverse=True)
+    return entries[:limit], len(entries)
+
 
 def _write_log(prefix: str, entry: dict) -> None:
     import os as _os
@@ -365,6 +405,17 @@ async def ingest_events(
             activity_counts[event.activity_name] = (
                 activity_counts.get(event.activity_name, 0) + 1
             )
+            _write_event_log(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "source": "events",
+                    "account_id": event.account_id,
+                    "activity_name": event.activity_name,
+                    "activity_data": event.activity_data,
+                    "session_id": event.session_id,
+                    "user_agent": (event.user_agent or "")[:120],
+                }
+            )
         except Exception as exc:
             logger.warning(f"Event error [{event.activity_name}]: {exc}")
             failed += 1
@@ -448,6 +499,17 @@ async def ingest_consumer_events(
                     affected[acc] = norm.get("taxon_id") or affected.get(acc)
             processed += 1
             activity_counts[row.event_name] = activity_counts.get(row.event_name, 0) + 1
+            _write_event_log(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "source": "consumer-events",
+                    "account_id": row.account_id,
+                    "event_name": row.event_name,
+                    "event_value": row.event_value,
+                    "session_id": row.session_id,
+                    "user_agent": (row.user_agent or "")[:120],
+                }
+            )
         except Exception as exc:
             logger.warning(f"Consumer event error [{row.event_name}]: {exc}")
             failed += 1
@@ -849,4 +911,11 @@ async def get_ingest_log(limit: int = 50) -> dict:
 @router.get("/logs/push", summary="Recent push log", response_model=dict)
 async def get_push_log(limit: int = 50) -> dict:
     entries, total = _read_logs(_PUSH_PFX, limit)
+    return {"entries": entries, "total_stored": total}
+
+
+@router.get("/logs/events", summary="Latest shop events log", response_model=dict)
+async def get_events_log(limit: int = 100) -> dict:
+    """Latest individual events received from the marketplace, newest first."""
+    entries, total = _read_event_logs(limit)
     return {"entries": entries, "total_stored": total}

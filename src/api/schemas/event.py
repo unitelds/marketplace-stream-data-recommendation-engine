@@ -297,3 +297,80 @@ class PlacementRecommendationResponse(BaseModel):
     context_taxon_id: Optional[str] = None
     context_product_id: Optional[str] = None
     served_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Handset / device recommendation schemas
+# ---------------------------------------------------------------------------
+
+
+class HandsetAccessoriesRequest(BaseModel):
+    """
+    Handset product page — 'Compatible accessories' panel.
+
+    Sent when a user opens a specific phone, tablet, or wearable product page.
+    Returns accessories (cases, chargers, earphones, bands) that are compatible
+    with or commonly bought alongside the anchor handset product.
+    Blends the external Marketplace catalogue API feed with internal CBF + CF.
+    """
+
+    account_id: str = Field(..., min_length=1)
+    handset_product_id: str = Field(
+        ..., min_length=1, description="The handset/device product being viewed"
+    )
+    top_n: int = Field(default=10, ge=1, le=30)
+    exclude_product_ids: list[str] = Field(default_factory=list)
+    require_in_stock: bool = Field(default=True)
+    accessory_taxon_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Restrict results to these catalog taxon IDs. "
+            "Empty = auto-resolve from accessory taxon slugs."
+        ),
+    )
+
+
+class HandsetFeedRequest(BaseModel):
+    """
+    Per-user multi-taxon handset/device feed.
+
+    Returns personalised recommendations across all device categories:
+    phones, tablets, wearables, earphones, and accessories.
+    Blends the external Marketplace catalogue API feed with internal
+    CBF + popularity per taxon.
+    """
+
+    account_id: str = Field(..., min_length=1)
+    taxon_slugs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Device-category slugs to include "
+            "(e.g. 'handset-cellphone', 'handset-accessory'). "
+            "Empty = all categories from HANDSET_FEED_MAP."
+        ),
+    )
+    top_n_per_taxon: int = Field(default=10, ge=1, le=30)
+    exclude_product_ids: list[str] = Field(default_factory=list)
+    require_in_stock: bool = Field(default=True)
+
+
+class HandsetFeedTaxonItem(BaseModel):
+    """Recommendations for a single device category taxon."""
+
+    taxon_slug: str
+    taxon_id: Optional[str] = None
+    recommendations: list[str]
+    count: int = 0
+    source: str = "internal"  # "marketplace_api" | "internal" | "mixed"
+
+
+class HandsetFeedResponse(BaseModel):
+    """Multi-taxon handset/device feed response."""
+
+    account_id: str
+    taxon_feeds: list[HandsetFeedTaxonItem]
+    total_products: int
+    strategy: str
+    intent_score: float = 0.0
+    device: str = "unknown"
+    served_at: datetime = Field(default_factory=datetime.utcnow)

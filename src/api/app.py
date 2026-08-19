@@ -48,6 +48,12 @@ try:
         APP_TITLE,
         APP_VERSION,
         LOG_DIR,
+        MARKETPLACE_API_BASE_URL,
+        ORACLE_POLL_INTERVAL_SECONDS,
+        PUSH_ENABLED,
+        PUSH_TOP_USERS_BATCH_SIZE,
+        PUSH_TOP_USERS_COUNT,
+        PUSH_TOP_USERS_INTERVAL_SECONDS,
         SYNC_INTERVAL_MINUTES,
     )
 except ImportError:
@@ -56,15 +62,25 @@ except ImportError:
     APP_DESCRIPTION = "Marketplace stream-data recommendation engine"
     LOG_DIR = "logs"
     SYNC_INTERVAL_MINUTES = 10
+    ORACLE_POLL_INTERVAL_SECONDS = 60
+    MARKETPLACE_API_BASE_URL = (
+        "https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation"
+    )
+    PUSH_ENABLED = True
+    PUSH_TOP_USERS_COUNT = 1000
+    PUSH_TOP_USERS_INTERVAL_SECONDS = 600
+    PUSH_TOP_USERS_BATCH_SIZE = 50
 
 _sync_task: asyncio.Task | None = None
 _delivery_task: asyncio.Task | None = None
+_oracle_poll_task: asyncio.Task | None = None
+_scheduled_push_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup and shutdown lifecycle."""
-    global _sync_task
+    global _sync_task, _delivery_task, _oracle_poll_task, _scheduled_push_task
 
     # ── Startup ────────────────────────────────────────────────────────────────
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -84,10 +100,42 @@ async def lifespan(app: FastAPI):
     _delivery_task = asyncio.create_task(_delivery_writer_loop())
     logger.info("Delivery log async writer started")
 
+    # Start Oracle event poller (pulls consumer_events from Oracle automatically)
+    if ORACLE_POLL_INTERVAL_SECONDS > 0:
+        from src.module.oracle_poller import run_oracle_poll_loop
+
+        _oracle_poll_task = asyncio.create_task(
+            run_oracle_poll_loop(ORACLE_POLL_INTERVAL_SECONDS)
+        )
+        logger.info(
+            f"Oracle event poller started (interval={ORACLE_POLL_INTERVAL_SECONDS}s)"
+        )
+    else:
+        logger.info("Oracle event poller disabled (TOKI_ORACLE_POLL_INTERVAL=0)")
+
+    # Start scheduled top-users push (every PUSH_TOP_USERS_INTERVAL_SECONDS)
+    if PUSH_ENABLED:
+        from src.module.scheduled_push import run_scheduled_push_loop
+
+        _scheduled_push_task = asyncio.create_task(
+            run_scheduled_push_loop(
+                interval_seconds=PUSH_TOP_USERS_INTERVAL_SECONDS,
+                top_n=PUSH_TOP_USERS_COUNT,
+                push_url=MARKETPLACE_API_BASE_URL,
+                batch_size=PUSH_TOP_USERS_BATCH_SIZE,
+            )
+        )
+        logger.info(
+            f"Scheduled push started — every {PUSH_TOP_USERS_INTERVAL_SECONDS}s, "
+            f"top {PUSH_TOP_USERS_COUNT} users → {MARKETPLACE_API_BASE_URL}"
+        )
+    else:
+        logger.info("Scheduled push disabled (TOKI_PUSH_ENABLED=false)")
+
     yield  # ← API is live here
 
     # ── Shutdown ───────────────────────────────────────────────────────────────
-    for task in (_sync_task, _delivery_task):
+    for task in (_sync_task, _delivery_task, _oracle_poll_task, _scheduled_push_task):
         if task and not task.done():
             task.cancel()
             try:
