@@ -141,7 +141,7 @@ class FeedPushRequest(FeedRequest):
 
     shop_feed_url: Optional[str] = Field(
         None,
-        description="Override shop feed endpoint. Default: MARKETPLACE_API_BASE_URL/{account_id}",
+        description="Override the delivery endpoint. Default: MARKETPLACE_PUSH_URL.",
     )
     push_timeout_seconds: float = Field(default=3.0, ge=0.5, le=30.0)
 
@@ -346,7 +346,8 @@ class HandsetFeedRequest(BaseModel):
         description=(
             "Device-category slugs to include "
             "(e.g. 'handset-cellphone', 'handset-accessory'). "
-            "Empty = all categories from HANDSET_FEED_MAP."
+            "Empty = the six device taxons in DEVICE_TAXON_SLUGS. Any catalog "
+            "taxon slug is accepted; non-device slugs resolve via the TOKI Shop feed."
         ),
     )
     top_n_per_taxon: int = Field(default=10, ge=1, le=30)

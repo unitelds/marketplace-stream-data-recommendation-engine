@@ -27,6 +27,7 @@ from src.api.routes.dashboard import router as dashboard_router
 from src.api.routes.events import router as events_router
 from src.api.routes.health import router as health_router
 from src.api.routes.recommendations import router as recommendations_router
+from src.module import marketplace_push, upstream
 from src.module.catalog_sync import run_scheduled_sync, sync_catalog
 
 
@@ -48,7 +49,6 @@ try:
         APP_TITLE,
         APP_VERSION,
         LOG_DIR,
-        MARKETPLACE_API_BASE_URL,
         ORACLE_POLL_INTERVAL_SECONDS,
         PUSH_ENABLED,
         PUSH_TOP_USERS_BATCH_SIZE,
@@ -63,9 +63,6 @@ except ImportError:
     LOG_DIR = "logs"
     SYNC_INTERVAL_MINUTES = 10
     ORACLE_POLL_INTERVAL_SECONDS = 60
-    MARKETPLACE_API_BASE_URL = (
-        "https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation"
-    )
     PUSH_ENABLED = True
     PUSH_TOP_USERS_COUNT = 1000
     PUSH_TOP_USERS_INTERVAL_SECONDS = 600
@@ -121,16 +118,27 @@ async def lifespan(app: FastAPI):
             run_scheduled_push_loop(
                 interval_seconds=PUSH_TOP_USERS_INTERVAL_SECONDS,
                 top_n=PUSH_TOP_USERS_COUNT,
-                push_url=MARKETPLACE_API_BASE_URL,
+                push_url=marketplace_push.target_url(),
                 batch_size=PUSH_TOP_USERS_BATCH_SIZE,
             )
         )
         logger.info(
             f"Scheduled push started — every {PUSH_TOP_USERS_INTERVAL_SECONDS}s, "
-            f"top {PUSH_TOP_USERS_COUNT} users → {MARKETPLACE_API_BASE_URL}"
+            f"top {PUSH_TOP_USERS_COUNT} users → {marketplace_push.target_url()}"
         )
     else:
         logger.info("Scheduled push disabled (TOKI_PUSH_ENABLED=false)")
+
+    logger.info(
+        "Upstream feeds — catalog: {}  |  shop: {}".format(
+            upstream.CATALOG_FEED.base_url, upstream.SHOP_FEED.base_url
+        )
+    )
+    if not marketplace_push.is_configured():
+        logger.warning(
+            "TOKI_MARKETPLACE_PUSH_TOKEN is not set — "
+            f"{marketplace_push.target_url()} will reject deliveries with 401"
+        )
 
     yield  # ← API is live here
 
@@ -142,6 +150,8 @@ async def lifespan(app: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
+    await upstream.aclose()
+    await marketplace_push.aclose()
     logger.info("Recommendation engine shutdown complete")
 
 
@@ -159,6 +169,20 @@ def create_app() -> FastAPI:
 
     # Middleware stack
     app.add_middleware(_TimingMiddleware)
+
+    # API-key auth. Off by default: the marketplace event stream currently calls
+    # /api/v1/events without a key, so turning this on before the caller is
+    # updated would silently drop ingestion. Enable with TOKI_AUTH_ENABLED=true
+    # once TOKI_API_KEYS is provisioned and the shop sends X-API-Key.
+    if os.getenv("TOKI_AUTH_ENABLED", "false").lower() == "true":
+        from src.api.middleware.auth import APIKeyMiddleware
+
+        app.add_middleware(APIKeyMiddleware)
+        logger.info("API key authentication enabled")
+    else:
+        logger.warning(
+            "API key authentication DISABLED — set TOKI_AUTH_ENABLED=true to enforce"
+        )
 
     # CORS — restrict in production via environment variable
     allowed_origins = os.getenv("TOKI_CORS_ORIGINS", "*").split(",")

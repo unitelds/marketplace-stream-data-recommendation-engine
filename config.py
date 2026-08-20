@@ -64,7 +64,18 @@ ERROR_ANALYSIS_TABLE = "recommendation_error_analysis_version2"
 # ─────────────────────────────────────────────────────────
 # CATALOG QUERY — dynamic based on table name
 # ─────────────────────────────────────────────────────────
-CATALOG_QUERY = f"SELECT * FROM {CATALOG_TABLE} WHERE to_date(substr(created_at, 1, 10), 'YYYY-MM-DD') > to_date('20250901', 'YYYYMMDD');"
+# The whole table IS the live catalog (4,914 rows / 79 taxons as of 2026-08-20).
+# The previous `created_at > 2025-09-01` filter silently dropped 5 products whose
+# created_at predates the v3 migration; there is no business reason to hide them.
+# Set TOKI_CATALOG_MIN_CREATED_AT=YYYYMMDD to re-enable a cutoff.
+_CATALOG_MIN_CREATED_AT = os.getenv("TOKI_CATALOG_MIN_CREATED_AT", "").strip()
+if _CATALOG_MIN_CREATED_AT:
+    CATALOG_QUERY = (
+        f"SELECT * FROM {CATALOG_TABLE} WHERE to_date(substr(created_at, 1, 10), "
+        f"'YYYY-MM-DD') > to_date('{_CATALOG_MIN_CREATED_AT}', 'YYYYMMDD')"
+    )
+else:
+    CATALOG_QUERY = f"SELECT * FROM {CATALOG_TABLE}"
 
 # ─────────────────────────────────────────────────────────
 # CACHE CONFIGURATION
@@ -85,7 +96,7 @@ ORACLE_POLL_INTERVAL_SECONDS = int(
 )  # 0 = disabled
 BATCH_SIZE = 100  # doubled: 32-core server has headroom
 MAX_CONCURRENT_DB_OPERATIONS = (
-    12  # aligned to actual pool capacity (pool_size+max_overflow=15)
+    16  # aligned to actual pool capacity (pool_size 8 + max_overflow 12 = 20)
 )
 USER_PREFERENCES_CACHE_TTL = 600
 USER_PREFERENCES_CACHE_SIZE = 10000
@@ -95,10 +106,9 @@ ENABLE_AGGRESSIVE_CACHING = True
 # ─────────────────────────────────────────────────────────
 # DB CONNECTION POOL
 # ─────────────────────────────────────────────────────────
-DB_POOL_SIZE = int(os.getenv("TOKI_DB_POOL_SIZE", 5))
-DB_MAX_OVERFLOW = int(
-    os.getenv("TOKI_DB_MAX_OVERFLOW", 10)
-)  # 8 → 10: 24 workers × 15 max = 360 << PG limit 2000
+# 24 workers × (8 + 12) = 480 connections, well under the PG limit of 2000.
+DB_POOL_SIZE = int(os.getenv("TOKI_DB_POOL_SIZE", 8))
+DB_MAX_OVERFLOW = int(os.getenv("TOKI_DB_MAX_OVERFLOW", 12))
 DB_POOL_TIMEOUT = 10
 DB_POOL_RECYCLE = 600
 
@@ -208,88 +218,132 @@ SCORE_WEIGHTS = {
     "diversity_bonus": 0.05,
 }
 
-# ─────────────────────────────────────────────────────────
-# TOKI SHOP FEED — pull pre-computed taxon recs per user
-# GET {TOKI_SHOP_FEED_URL}/{account_id} → {"products":[{"productId":"...","taxonId":"..."}]}
-# Used exclusively by the taxon placement endpoint; all other placements use the core engine.
-# ─────────────────────────────────────────────────────────
-TOKI_SHOP_FEED_URL = os.getenv(
-    "TOKI_SHOP_FEED_URL", "http://10.21.60.94:9000/marketplace"
+# ═════════════════════════════════════════════════════════════════════════════
+# EXTERNAL INTEGRATION TOPOLOGY
+# ═════════════════════════════════════════════════════════════════════════════
+# Verified against the live services on 2026-08-20.
+#
+#   INBOUND  (this engine reads)
+#     10.21.60.94:9000  Marketplace Catalog API — "Handset-shop feed"
+#                       GET /marketplace/{account_id}
+#                       6 device taxons: handset · tablet · watch · earphones ·
+#                       accessory · cpe.  Read-only (OpenAPI exposes only
+#                       /health, /ready, /marketplace/{user_id}).
+#     10.21.60.94:8018  TOKI Shop Feed — legacy demographic model
+#                       GET /api/recommendations/{account_id}
+#                       Full catalogue (~80 taxons).  Always answers, using
+#                       demographic cohorts for unknown users → cold-start bridge.
+#
+#   INBOUND  (marketplace.toki.mn writes to us)
+#     POST /api/v1/events, /api/v1/consumer-events   engagement stream
+#
+#   OUTBOUND (this engine writes)
+#     POST {MARKETPLACE_PUSH_URL}                    recommendation delivery
+#
+# Both upstreams share one response envelope:
+#   {"userId": "...", "taxonRecommendations": {"<slug>": ["<productId>", ...]}}
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Device taxons carried by the Marketplace Catalog API (port 9000).
+# These slugs match taxon_name in the catalog table one-for-one.
+DEVICE_TAXON_SLUGS = (
+    "handset-cellphone",
+    "tablet",
+    "watch-and-smart-watches",
+    "headphones-earphones",
+    "handset-accessory",
+    "cpe",
 )
-TOKI_SHOP_FEED_TIMEOUT = float(
-    os.getenv("TOKI_SHOP_FEED_TIMEOUT", 1.0)
-)  # must be fast — sits on taxon page critical path
-TOKI_SHOP_FEED_CACHE_TTL = int(
-    os.getenv("TOKI_SHOP_FEED_CACHE_TTL", 120)
-)  # seconds — feed changes slowly
-TOKI_SHOP_FEED_CACHE_SIZE = int(
-    os.getenv("TOKI_SHOP_FEED_CACHE_SIZE", 20000)
-)  # max cached accounts
 
-# ─────────────────────────────────────────────────────────
-# FORMER REC ENGINE — cold-start bridge (all placements)
-# GET {FORMER_REC_ENGINE_URL}/api/recommendations/{user_id}
-# Used as seed products when the core engine has no history for a user.
-# Async fetch on placement endpoints; sync cache-read on thread-pool path.
-# ─────────────────────────────────────────────────────────
-FORMER_REC_ENGINE_URL = os.getenv("FORMER_REC_ENGINE_URL", "http://10.21.60.94:8018")
-FORMER_REC_ENGINE_TIMEOUT = float(
-    os.getenv("FORMER_REC_ENGINE_TIMEOUT", 0.5)
-)  # sub-second — must not block critical path
-FORMER_REC_ENGINE_CACHE_TTL = int(
-    os.getenv("FORMER_REC_ENGINE_CACHE_TTL", 600)
-)  # 10 min
-FORMER_REC_ENGINE_CACHE_SIZE = int(os.getenv("FORMER_REC_ENGINE_CACHE_SIZE", 50000))
+# Companion categories offered alongside a handset on the product page.
+ACCESSORY_TAXON_SLUGS = (
+    "handset-accessory",
+    "headphones-earphones",
+    "watch-and-smart-watches",
+)
 
-# ─────────────────────────────────────────────────────────
-# MARKETPLACE PUSH — recommendation delivery to the shop API
-# Staging:    https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation
-# Production: http://10.21.60.94:9000/marketplace    (set TOKI_MARKETPLACE_PUSH_URL)
-# Override any time with TOKI_MARKETPLACE_PUSH_URL env var.
-# ─────────────────────────────────────────────────────────
+# ── INBOUND 1: Marketplace Catalog API (handset-shop feed, port 9000) ─────────
+CATALOG_FEED_URL = os.getenv(
+    "TOKI_CATALOG_FEED_URL", "http://10.21.60.94:9000/marketplace"
+)
+CATALOG_FEED_TIMEOUT = float(os.getenv("TOKI_CATALOG_FEED_TIMEOUT", 1.5))
+CATALOG_FEED_CACHE_TTL = int(os.getenv("TOKI_CATALOG_FEED_CACHE_TTL", 3600))  # 1 h
+CATALOG_FEED_CACHE_SIZE = int(os.getenv("TOKI_CATALOG_FEED_CACHE_SIZE", 20_000))
+
+# ── INBOUND 2: TOKI Shop Feed (legacy demographic engine, port 8018) ──────────
+SHOP_FEED_URL = os.getenv(
+    "TOKI_SHOP_FEED_URL", "http://10.21.60.94:8018/api/recommendations"
+)
+SHOP_FEED_TIMEOUT = float(os.getenv("TOKI_SHOP_FEED_TIMEOUT", 1.5))
+SHOP_FEED_CACHE_TTL = int(os.getenv("TOKI_SHOP_FEED_CACHE_TTL", 600))  # 10 min
+SHOP_FEED_CACHE_SIZE = int(os.getenv("TOKI_SHOP_FEED_CACHE_SIZE", 50_000))
+
+# Shared httpx connection-pool ceiling for all upstream + push traffic.
+UPSTREAM_MAX_CONNECTIONS = int(os.getenv("TOKI_UPSTREAM_MAX_CONNECTIONS", 100))
+
+# ── OUTBOUND: recommendation delivery to marketplace.toki.mn ──────────────────
+# Both hosts require `Authorization: Bearer <token>` — an unauthenticated call
+# returns 401 {"message":"Authentication required"}.  Set the token at deploy
+# time; never commit it.
 _PUSH_URL_STAGING = "https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation"
-_PUSH_URL_PRODUCTION = "http://10.21.60.94:9000/marketplace"
-MARKETPLACE_API_BASE_URL = os.getenv(
+_PUSH_URL_PRODUCTION = "https://marketplace.toki.mn/ms/catalogue/v1/recommendation"
+MARKETPLACE_PUSH_URL = os.getenv(
     "TOKI_MARKETPLACE_PUSH_URL",
     _PUSH_URL_PRODUCTION if ENVIRONMENT == "production" else _PUSH_URL_STAGING,
 )
-MARKETPLACE_API_TIMEOUT = int(os.getenv("TOKI_MARKETPLACE_PUSH_TIMEOUT", 3))
+MARKETPLACE_PUSH_TOKEN = os.getenv("TOKI_MARKETPLACE_PUSH_TOKEN", "")
+MARKETPLACE_PUSH_TIMEOUT = float(os.getenv("TOKI_MARKETPLACE_PUSH_TIMEOUT", 5.0))
+MARKETPLACE_PUSH_RETRIES = int(os.getenv("TOKI_MARKETPLACE_PUSH_RETRIES", 2))
+# Request-body shape: "products" | "product_ids" | "taxon_map" — see
+# src/module/marketplace_push.py.  Production rejects "products" with
+# 400 {"message": "productId and accountId are required"}; confirm the contract
+# with the marketplace team and set this accordingly.
+MARKETPLACE_PUSH_PAYLOAD_FORMAT = os.getenv(
+    "TOKI_MARKETPLACE_PUSH_PAYLOAD_FORMAT", "products"
+)
 
-# ─────────────────────────────────────────────────────────
-# SCHEDULED TOP-USERS PUSH — every PUSH_TOP_USERS_INTERVAL_SECONDS
-# Pushes personalized feeds for the top PUSH_TOP_USERS_COUNT most active users.
-# Only ONE gunicorn worker runs the loop (file-lock coordination).
-# Disable by setting TOKI_PUSH_ENABLED=false.
-# ─────────────────────────────────────────────────────────
-PUSH_ENABLED = os.getenv("TOKI_PUSH_ENABLED", "true").lower() != "false"
+# ── SCHEDULED TOP-USERS PUSH ─────────────────────────────────────────────────
+# Pushes personalized feeds for the top PUSH_TOP_USERS_COUNT most active users
+# every PUSH_TOP_USERS_INTERVAL_SECONDS.  Only ONE gunicorn worker runs the loop
+# (file-lock coordination).
+#
+# OFF by default (2026-08-20): a live delivery came back
+#   400 {"message": "productId and accountId are required"}
+# so the loop would fire ~1000 rejected POSTs at production every 10 minutes.
+# Re-enable with TOKI_PUSH_ENABLED=true once delivery is confirmed working.
+# Event ingestion and all placement endpoints are unaffected by this switch.
+PUSH_ENABLED = os.getenv("TOKI_PUSH_ENABLED", "false").lower() == "true"
 PUSH_TOP_USERS_COUNT = int(os.getenv("TOKI_PUSH_TOP_USERS", 1000))
 PUSH_TOP_USERS_INTERVAL_SECONDS = int(os.getenv("TOKI_PUSH_INTERVAL", 600))  # 10 min
-PUSH_TOP_USERS_BATCH_SIZE = int(
-    os.getenv("TOKI_PUSH_BATCH_SIZE", 50)
-)  # concurrent per wave
+PUSH_TOP_USERS_BATCH_SIZE = int(os.getenv("TOKI_PUSH_BATCH_SIZE", 50))
 
-HANDSET_FEED_TABLE = "tmp_marketplace_handset_feed"  # retained for reference
-HANDSET_FEED_MAP = {
-    "handset-cellphone": "HANDSET_PROD_ID",
-    "tablet": "TABLET_PROD_ID",
-    "watch-and-smart-watches": "WATCH_PROD_ID",
-    "headphones-earphones": "EARBUDS_PROD_ID",
-    "handset-accessory": "ACCESSORY_PROD_ID",
-    "cpe": "CPE_PROD_ID",
-}
-HANDSET_FEED_TOP_N = 100  # prebuilt products to prepend per taxon
-HANDSET_FEED_CACHE_SIZE = 10000  # LRU entries (hot users)
-HANDSET_FEED_CACHE_TTL = 3600  # 1 hour
+# Prebuilt upstream products to prepend per taxon slot before the core engine
+# fills the remainder.
+FEED_TOP_N_PER_TAXON = int(os.getenv("TOKI_FEED_TOP_N_PER_TAXON", 100))
+
+# ── Deprecated aliases — retained so out-of-tree callers keep importing ───────
+# Prefer CATALOG_FEED_URL / SHOP_FEED_URL / MARKETPLACE_PUSH_URL.
+MARKETPLACE_API_BASE_URL = MARKETPLACE_PUSH_URL
+MARKETPLACE_API_TIMEOUT = MARKETPLACE_PUSH_TIMEOUT
+FORMER_REC_ENGINE_URL = SHOP_FEED_URL
+FORMER_REC_ENGINE_TIMEOUT = SHOP_FEED_TIMEOUT
+FORMER_REC_ENGINE_CACHE_TTL = SHOP_FEED_CACHE_TTL
+FORMER_REC_ENGINE_CACHE_SIZE = SHOP_FEED_CACHE_SIZE
+HANDSET_FEED_TOP_N = FEED_TOP_N_PER_TAXON
+HANDSET_FEED_CACHE_SIZE = CATALOG_FEED_CACHE_SIZE
+HANDSET_FEED_CACHE_TTL = CATALOG_FEED_CACHE_TTL
 
 # ─────────────────────────────────────────────────────────
 # APPLICATION METADATA
 # ─────────────────────────────────────────────────────────
 APP_TITLE = "TOKI Marketplace Recommendation System v2"
-APP_VERSION = "4.2.0"
+APP_VERSION = "4.3.0"
 APP_DESCRIPTION = (
-    "Enhanced recommendation system with intelligent caching, "
-    "dynamic feeds, prebuilt handset feed integration, expanded taxonomy, "
-    "error analysis, delivery tracking, and API key authentication."
+    "Engagement-based recommendation engine for the TOKI marketplace. "
+    "Ingests the marketplace event stream, blends TF-IDF content-based and "
+    "item-based collaborative filtering with two upstream feeds "
+    "(Marketplace Catalog API :9000 and TOKI Shop Feed :8018), and delivers "
+    "personalised recommendations back to marketplace.toki.mn."
 )
 
 # ─────────────────────────────────────────────────────────
@@ -312,13 +366,9 @@ API_KEYS_ENV_VAR = "TOKI_API_KEYS"
 PEAK_CONCURRENT_USERS = int(os.getenv("TOKI_PEAK_USERS", 1000))
 
 # Feature store keeps all product vectors in RAM.
-# 4511 products × 30000 TF-IDF float32 features ≈ 540 MB sparse (actual: ~8 MB
+# 4914 products × 30000 TF-IDF float32 features ≈ 590 MB dense (actual: ~8 MB
 # after scipy sparse compression).  User-item matrix grows with traffic;
 # 1000 users × 500 products × 8 bytes ≈ 4 MB. Well within 40 GB budget.
 FEATURE_STORE_MAX_USERS = int(os.getenv("TOKI_FS_MAX_USERS", 500_000))
 FEATURE_STORE_MAX_PRODUCTS_PER_USER = int(os.getenv("TOKI_FS_MAX_PROD_PER_USER", 1000))
 
-# DB pool: 24 workers × max 15 connections = 360 connections << PG limit 2000
-# Each catalog sync needs 1 connection; recommendation endpoints are in-memory.
-DB_POOL_SIZE = int(os.getenv("TOKI_DB_POOL_SIZE", 8))  # raised from 5
-DB_MAX_OVERFLOW = int(os.getenv("TOKI_DB_MAX_OVERFLOW", 12))  # raised from 10

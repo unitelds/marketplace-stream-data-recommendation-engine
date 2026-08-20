@@ -1,20 +1,21 @@
 """
 Scheduled top-users recommendation push.
 
-Runs a background loop that every PUSH_TOP_USERS_INTERVAL_SECONDS:
-  1. Fetches the top PUSH_TOP_USERS_COUNT most active users from the feature store
-  2. Generates personalised multi-taxon feeds in async batches
-  3. POSTs each feed to the configured marketplace push URL
+Every ``PUSH_TOP_USERS_INTERVAL_SECONDS`` this loop:
+  1. takes the top ``PUSH_TOP_USERS_COUNT`` most active users from the feature store
+  2. generates a personalised multi-taxon feed for each, in the thread pool
+  3. delivers them to the marketplace via :mod:`src.module.marketplace_push`
 
-Only ONE gunicorn worker executes the loop at any time; the others skip via a
-shared file-lock timestamp (no Redis needed — same host, same filesystem).
+Only ONE gunicorn worker executes the cycle; the others skip via a shared
+file-lock timestamp (no Redis needed — same host, same filesystem).
 
 Config (all overridable via env vars):
-  TOKI_PUSH_ENABLED          true | false       (default: true)
-  TOKI_MARKETPLACE_PUSH_URL  full push endpoint  (auto-selected by TOKI_ENV)
-  TOKI_PUSH_TOP_USERS        1000               (users per cycle)
-  TOKI_PUSH_INTERVAL         600                (seconds between cycles — 10 min)
-  TOKI_PUSH_BATCH_SIZE       50                 (concurrent feed generations per wave)
+  TOKI_PUSH_ENABLED             true | false  (default: true)
+  TOKI_MARKETPLACE_PUSH_URL     full push endpoint (auto-selected by TOKI_ENV)
+  TOKI_MARKETPLACE_PUSH_TOKEN   bearer token — delivery 401s without it
+  TOKI_PUSH_TOP_USERS           1000          (users per cycle)
+  TOKI_PUSH_INTERVAL            600           (seconds between cycles)
+  TOKI_PUSH_BATCH_SIZE          50            (concurrent generations per wave)
 """
 
 from __future__ import annotations
@@ -25,23 +26,18 @@ import re
 import time
 from datetime import datetime, timezone
 
-import httpx
 from loguru import logger
+
+from src.module import marketplace_push
 
 try:
     from config import (
-        MARKETPLACE_API_BASE_URL,
-        MARKETPLACE_API_TIMEOUT,
         PUSH_ENABLED,
         PUSH_TOP_USERS_BATCH_SIZE,
         PUSH_TOP_USERS_COUNT,
         PUSH_TOP_USERS_INTERVAL_SECONDS,
     )
-except ImportError:
-    MARKETPLACE_API_BASE_URL = (
-        "https://staging-marketplace.toki.mn/ms/catalogue/v1/recommendation"
-    )
-    MARKETPLACE_API_TIMEOUT = 3
+except ImportError:  # pragma: no cover
     PUSH_ENABLED = True
     PUSH_TOP_USERS_COUNT = 1000
     PUSH_TOP_USERS_INTERVAL_SECONDS = 600
@@ -69,31 +65,8 @@ def _claim_leader() -> bool:
         return False
 
 
-async def _push_one(
-    client: httpx.AsyncClient,
-    account_id: str,
-    taxon_feeds: list[dict],
-    push_url: str,
-) -> tuple[str, str]:
-    """POST one feed to the marketplace. Returns (account_id, status)."""
-    payload = {
-        "accountId": account_id,
-        "products": [
-            {"productId": pid, "taxonId": tf["taxon_id"]}
-            for tf in taxon_feeds
-            for pid in tf.get("recommendations", [])
-        ],
-    }
-    try:
-        resp = await client.post(push_url, json=payload)
-        resp.raise_for_status()
-        return account_id, "ok"
-    except Exception as exc:
-        return account_id, f"failed:{str(exc)[:80]}"
-
-
 async def _push_cycle(top_n: int, push_url: str, batch_size: int) -> None:
-    """Generate and push feeds for the top N active users."""
+    """Generate and deliver feeds for the top N active users."""
     from src.api.routes.events import _PUSH_PFX, _write_log
     from src.module.feature_store import store
     from src.module.hybrid_ranker import recommend_multi_taxon
@@ -110,14 +83,14 @@ async def _push_cycle(top_n: int, push_url: str, batch_size: int) -> None:
     logger.info(f"Scheduled push start — {len(users)} users → {push_url}")
     ts_start = time.monotonic()
     ok_count = fail_count = skip_count = 0
+    loop = asyncio.get_running_loop()
 
-    async with httpx.AsyncClient(timeout=MARKETPLACE_API_TIMEOUT) as client:
-        for i in range(0, len(users), batch_size):
-            batch = users[i : i + batch_size]
+    for i in range(0, len(users), batch_size):
+        batch = users[i : i + batch_size]
 
-            # Generate feeds concurrently in thread pool
-            loop = asyncio.get_event_loop()
-            feed_tasks = [
+        # Generate feeds concurrently in the thread pool
+        feeds = await asyncio.gather(
+            *(
                 loop.run_in_executor(
                     None,
                     lambda uid=uid: recommend_multi_taxon(
@@ -125,48 +98,45 @@ async def _push_cycle(top_n: int, push_url: str, batch_size: int) -> None:
                     ),
                 )
                 for uid in batch
-            ]
-            feeds = await asyncio.gather(*feed_tasks, return_exceptions=True)
+            ),
+            return_exceptions=True,
+        )
 
-            # Push feeds concurrently
-            push_tasks = []
-            for uid, feed in zip(batch, feeds):
-                if isinstance(feed, Exception) or not feed:
-                    skip_count += 1
-                    continue
-                taxon_feeds = feed.get("taxon_feeds", [])
-                if not taxon_feeds:
-                    skip_count += 1
-                    continue
-                push_tasks.append(_push_one(client, uid, taxon_feeds, push_url))
+        items: list[tuple[str, list[dict]]] = []
+        for uid, feed in zip(batch, feeds):
+            if isinstance(feed, BaseException) or not feed:
+                skip_count += 1
+                continue
+            taxon_feeds = feed.get("taxon_feeds", [])
+            if not taxon_feeds:
+                skip_count += 1
+                continue
+            items.append((uid, taxon_feeds))
 
-            if push_tasks:
-                results = await asyncio.gather(*push_tasks)
-                now_iso = datetime.now(timezone.utc).isoformat()
-                for uid, status in results:
-                    if status == "ok":
-                        ok_count += 1
-                    else:
-                        fail_count += 1
-                    # Write to push log (same file aggregated by /api/v1/logs/push)
-                    _write_log(
-                        _PUSH_PFX,
-                        {
-                            "ts": now_iso,
-                            "account_id": uid,
-                            "products_count": sum(
-                                len(tf.get("recommendations", []))
-                                for feed in feeds
-                                if not isinstance(feed, Exception)
-                                for tf in feed.get("taxon_feeds", [])
-                            )
-                            // max(len(push_tasks), 1),
-                            "strategy": "scheduled_top_users",
-                            "push_url": push_url,
-                            "push_status": "ok" if status == "ok" else "failed",
-                            "push_error": None if status == "ok" else status,
-                        },
-                    )
+        if not items:
+            continue
+
+        results = await marketplace_push.push_many(
+            items, url=push_url, concurrency=batch_size
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for uid, status, error, count in results:
+            if status == "ok":
+                ok_count += 1
+            else:
+                fail_count += 1
+            _write_log(
+                _PUSH_PFX,
+                {
+                    "ts": now_iso,
+                    "account_id": uid,
+                    "products_count": count,
+                    "strategy": "scheduled_top_users",
+                    "push_url": push_url,
+                    "push_status": status,
+                    "push_error": error,
+                },
+            )
 
     elapsed = time.monotonic() - ts_start
     logger.info(
@@ -178,17 +148,24 @@ async def _push_cycle(top_n: int, push_url: str, batch_size: int) -> None:
 async def run_scheduled_push_loop(
     interval_seconds: int = PUSH_TOP_USERS_INTERVAL_SECONDS,
     top_n: int = PUSH_TOP_USERS_COUNT,
-    push_url: str = MARKETPLACE_API_BASE_URL,
+    push_url: str | None = None,
     batch_size: int = PUSH_TOP_USERS_BATCH_SIZE,
 ) -> None:
     """
     Background coroutine: push feeds for top N users on every interval.
-    Only the worker that wins _claim_leader() actually runs the cycle;
-    all others sleep and check again next interval.
+    Only the worker that wins ``_claim_leader()`` runs the cycle; the others
+    sleep and check again next interval.
     """
     if not PUSH_ENABLED:
         logger.info("Scheduled push disabled (TOKI_PUSH_ENABLED=false)")
         return
+
+    push_url = push_url or marketplace_push.target_url()
+    if not marketplace_push.is_configured():
+        logger.warning(
+            "Scheduled push: TOKI_MARKETPLACE_PUSH_TOKEN is not set — "
+            f"{push_url} will reject every delivery with 401"
+        )
 
     logger.info(
         f"Scheduled push loop started — every {interval_seconds}s, "

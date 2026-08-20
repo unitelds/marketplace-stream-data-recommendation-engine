@@ -16,7 +16,6 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
-import httpx
 from fastapi import APIRouter, BackgroundTasks, status
 from loguru import logger
 
@@ -691,66 +690,56 @@ def _bg_load_oracle(account_id: str) -> None:
 def _auto_push_feed(
     account_id: str, taxon_feeds: list[TaxonFeedItem], strategy: str = ""
 ) -> None:
-    """Background task: push feed to shop's configured API endpoint."""
+    """
+    Background task: deliver a feed to the marketplace recommendation API.
+
+    Gated on PUSH_ENABLED (TOKI_PUSH_ENABLED), which also gates the scheduled
+    top-users loop — so one switch stops all *automatic* delivery. The explicit
+    POST /api/v1/feed/push endpoint is unaffected and always attempts delivery.
+    """
+    try:
+        from config import PUSH_ENABLED
+    except ImportError:
+        PUSH_ENABLED = False
+    if not PUSH_ENABLED:
+        logger.debug(f"Auto-push disabled (TOKI_PUSH_ENABLED=false) [{account_id}]")
+        return
     if not _is_valid_account_id(account_id):
         logger.debug(
             f"Auto-push skipped: accountId '{account_id}' is not a 24-char hex ObjectId"
         )
         return
+
+    import asyncio as _asyncio
+
+    from src.module import marketplace_push
+
+    push_url = marketplace_push.target_url()
+    loop = _asyncio.new_event_loop()
     try:
-        from config import MARKETPLACE_API_BASE_URL, MARKETPLACE_API_TIMEOUT
-
-        push_url = MARKETPLACE_API_BASE_URL
-        payload = {
-            "accountId": account_id,
-            "products": [
-                {"productId": pid, "taxonId": tf.taxon_id}
-                for tf in taxon_feeds
-                for pid in tf.recommendations
-            ],
-        }
-        import httpx as _httpx
-
-        with _httpx.Client(timeout=MARKETPLACE_API_TIMEOUT) as client:
-            resp = client.post(push_url, json=payload)
-            resp.raise_for_status()
-        total = sum(len(tf.recommendations) for tf in taxon_feeds)
-        logger.info(
-            f"Feed auto-pushed to {push_url}: {total} products [{resp.status_code}]"
+        status_, error, count = loop.run_until_complete(
+            marketplace_push.push(account_id, taxon_feeds)
         )
-        _write_log(
-            _PUSH_PFX,
-            {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "account_id": account_id,
-                "products_count": total,
-                "strategy": strategy,
-                "push_url": push_url,
-                "push_status": "ok",
-                "push_error": None,
-            },
-        )
-    except Exception as exc:
-        push_url_safe = None
-        try:
-            from config import MARKETPLACE_API_BASE_URL
+    except Exception as exc:  # never let a push failure escape a background task
+        status_, error, count = "failed", str(exc)[:200], 0
+    finally:
+        loop.run_until_complete(marketplace_push.aclose())
+        loop.close()
 
-            push_url_safe = MARKETPLACE_API_BASE_URL
-        except Exception:
-            pass
-        _write_log(
-            _PUSH_PFX,
-            {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "account_id": account_id,
-                "products_count": 0,
-                "strategy": strategy,
-                "push_url": push_url_safe,
-                "push_status": "failed",
-                "push_error": str(exc)[:200],
-            },
-        )
-        logger.warning(f"Feed auto-push failed [{account_id}]: {exc}")
+    if status_ == "ok":
+        logger.info(f"Feed auto-pushed to {push_url}: {count} products")
+    _write_log(
+        _PUSH_PFX,
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "account_id": account_id,
+            "products_count": count,
+            "strategy": strategy,
+            "push_url": push_url,
+            "push_status": status_,
+            "push_error": error,
+        },
+    )
 
 
 def _bg_push_feed_for_user(account_id: str) -> None:
@@ -834,49 +823,34 @@ async def feed_push(
             _log_delivered, req.account_id, all_pids, result.get("strategy", "feed")
         )
 
-    push_url = req.shop_feed_url
-    if not push_url:
-        try:
-            from config import MARKETPLACE_API_BASE_URL
+    from src.module import marketplace_push
 
-            push_url = MARKETPLACE_API_BASE_URL
-        except ImportError:
-            push_url = None
-
+    push_url = req.shop_feed_url or marketplace_push.target_url()
     push_status, push_error = "not_attempted", None
 
     if push_url and taxon_feeds:
         if not _is_valid_account_id(req.account_id):
             push_status = "skipped"
-            push_error = f"accountId '{req.account_id}' must be a 24-char hex string (MongoDB ObjectId)"
+            push_error = (
+                f"accountId '{req.account_id}' must be a 24-char hex string "
+                "(MongoDB ObjectId)"
+            )
             logger.warning(push_error)
         else:
-            push_payload = {
-                "accountId": req.account_id,
-                "products": [
-                    {"productId": pid, "taxonId": tf.taxon_id}
-                    for tf in taxon_feeds
-                    for pid in tf.recommendations
-                ],
-            }
-            try:
-                async with httpx.AsyncClient(
-                    timeout=req.push_timeout_seconds
-                ) as client:
-                    resp = await client.post(push_url, json=push_payload)
-                    resp.raise_for_status()
-                push_status = "ok"
-                logger.info(f"Feed pushed to {push_url} [{resp.status_code}]")
-            except Exception as exc:
-                push_status = "failed"
-                push_error = str(exc)[:200]
-                logger.warning(f"Feed push failed [{push_url}]: {exc}")
+            push_status, push_error, pushed_count = await marketplace_push.push(
+                req.account_id,
+                taxon_feeds,
+                url=push_url,
+                timeout=req.push_timeout_seconds,
+            )
+            if push_status == "ok":
+                logger.info(f"Feed pushed to {push_url}: {pushed_count} products")
             _write_log(
                 _PUSH_PFX,
                 {
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "account_id": req.account_id,
-                    "products_count": len(push_payload["products"]),
+                    "products_count": pushed_count,
                     "strategy": result.get("strategy"),
                     "push_url": push_url,
                     "push_status": push_status,

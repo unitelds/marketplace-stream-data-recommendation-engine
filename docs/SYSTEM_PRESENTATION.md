@@ -74,21 +74,22 @@ flowchart LR
     end
 
     subgraph POSTGRES["PostgreSQL Catalog"]
-        C1["50,000+ Products\nPrices · Stock · Categories\nSpecs · Keywords · Grade"]
+        C1["4,914 Products · 79 taxons\nPrices · Stock · Categories\nSpecs · Keywords · Grade"]
     end
 
-    subgraph EXTERNAL["External Feed APIs"]
-        D1["📱 Marketplace Catalogue API\nstaging-marketplace.toki.mn\nHandsets · Tablets · Watches\nEarphones · Accessories · CPE"]
-        D2["🔗 Toki Shop Feed\n10.21.60.94:9000\nPre-built taxon product slots"]
+    subgraph EXTERNAL["Upstream Feed APIs (10.21.60.94)"]
+        D1["📱 Marketplace Catalog API :9000\nGET /marketplace/{accountId}\nHandsets · Tablets · Watches\nEarphones · Accessories · CPE"]
+        D2["🔗 TOKI Shop Feed :8018\nGET /api/recommendations/{accountId}\nLegacy demographic model\nFull ~80-taxon coverage"]
     end
 
     A1 & A2 & A3 & A4 & A5 -->|POST /api/v1/events\nstream in real-time| ENG
     B1 -->|background poller| ENG
     C1 -->|sync every 10 min| ENG
-    D1 -->|handset & accessory endpoints| ENG
-    D2 -->|category page endpoint| ENG
+    D1 -->|prebuilt device slots| ENG
+    D2 -->|full taxonomy + cold-start seeds| ENG
+    ENG -->|POST /ms/catalogue/v1/recommendation\nBearer auth| OUT["🛍️ marketplace.toki.mn"]
 
-    ENG(["🧠 Engine\nv4.2.0"])
+    ENG(["🧠 Engine\nv4.3.0"])
 ```
 
 ### Signal Weighting — Not All Events Are Equal
@@ -184,12 +185,22 @@ graph LR
 
 ## 07 · The Handset & Device Pipeline (New)
 
-The handset pipeline connects to the **external Marketplace Catalogue API** and layers it with the internal recommendation engine — giving device pages a dedicated, deeply personalised experience.
+The handset pipeline connects to the **Marketplace Catalog API on port 9000** and layers it with the internal recommendation engine — giving device pages a dedicated, deeply personalised experience. Categories outside the six device taxons fall through to the **TOKI Shop Feed on port 8018**, which covers the whole catalogue.
+
+Both upstreams return the same envelope:
+
+```json
+{ "userId": "...", "taxonRecommendations": { "handset-cellphone": ["<productId>", ...] } }
+```
+
+Every product ID from either feed is checked against the synced catalog before it
+is served — roughly 9% of catalog-feed IDs reference delisted SKUs.
 
 ```mermaid
 flowchart TD
     subgraph HSOURCES["Handset Data Sources"]
-        HA["📱 Marketplace Catalogue API\nstaging-marketplace.toki.mn\nPer-user · cached 1 hour"]
+        HA["📱 Marketplace Catalog API\n10.21.60.94:9000\nPer-user · cached 1 hour"]
+        HS["🔗 TOKI Shop Feed\n10.21.60.94:8018\nPer-user · cached 10 min"]
         HB["🧠 Internal Engine\nCBF + CF + Popularity"]
     end
 
@@ -207,7 +218,8 @@ flowchart TD
         E2["POST /recommendations/handset/feed\nPer-user full device category feed\nAll 6 taxon slots"]
     end
 
-    HA -->|API products fill slots first| T1 & T2 & T3 & T4 & T5 & T6
+    HA -->|fills slots first| T1 & T2 & T3 & T4 & T5 & T6
+    HS -->|fills what :9000 missed| T1 & T2 & T3 & T4 & T5 & T6
     HB -->|fills remaining slots| T1 & T2 & T3 & T4 & T5 & T6
     T1 & T2 & T3 & T4 & T5 & T6 --> E1
     T1 & T2 & T3 & T4 & T5 & T6 --> E2
@@ -215,12 +227,13 @@ flowchart TD
 
 **How accessory recommendations work for a phone page:**
 
-1. Fetch this user's handset feed from the Marketplace Catalogue API (cached 1 h)
-2. Pull accessory, earphone, and wearable slots → these products are shown first
+1. Fetch this user's device feed from the Marketplace Catalog API :9000 (cached 1 h)
+2. Round-robin the accessory, earphone, and wearable slots → these are shown first
+   (round-robin so one category cannot take every slot)
 3. Run TF-IDF CBF from the phone's content vector, **scoped to accessory taxons only**
 4. Run CF co-purchase signals for that phone, scoped to accessories
 5. RRF merge the internal results, apply re-rankers, fill remaining slots
-6. Tag each result with source: `marketplace_api` / `internal` / `mixed`
+6. Tag each result with source: `catalog_api` / `shop_feed` / `catalog_api+shop_feed` / `internal` / `mixed`
 
 ---
 
@@ -374,9 +387,9 @@ graph TD
         ORA["Oracle DB\nConsumer event history\n24 h lookback · MN timezone"]
     end
 
-    subgraph EXTAPIS["External Feed APIs"]
-        TF["Toki Shop Feed\n10.21.60.94:9000\nCache 120 s · 20,000 users"]
-        MKT["Marketplace Catalogue API\nstaging-marketplace.toki.mn\nCache 3,600 s · 10,000 users"]
+    subgraph EXTAPIS["Upstream Feed APIs"]
+        MKT["Marketplace Catalog API\n10.21.60.94:9000\nCache 3,600 s · 20,000 users"]
+        TF["TOKI Shop Feed\n10.21.60.94:8018\nCache 600 s · 50,000 users"]
     end
 
     subgraph JOBS["Background Jobs (per worker)"]

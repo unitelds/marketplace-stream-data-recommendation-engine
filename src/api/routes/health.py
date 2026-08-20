@@ -1,9 +1,10 @@
 """
 Health and status endpoints.
 
-GET /api/v1/health         — liveness check (always 200)
-GET /api/v1/catalog/status — catalog sync state + TF-IDF stats
-GET /api/v1/catalog/sync   — manually trigger a catalog re-sync
+GET /api/v1/health           — liveness check (always 200)
+GET /api/v1/catalog/status   — catalog sync state + TF-IDF stats
+GET /api/v1/catalog/sync     — manually trigger a catalog re-sync
+GET /api/v1/integrations     — upstream feed + push-target health
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks
 
+from src.module import marketplace_push, upstream
 from src.module.catalog_sync import sync_catalog
 from src.module.feature_store import store
 
@@ -91,5 +93,32 @@ async def trigger_catalog_sync(background_tasks: BackgroundTasks) -> dict:
     return {
         "status": "sync_triggered",
         "message": "Catalog re-sync started in background. Check /catalog/status for progress.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get(
+    "/integrations",
+    summary="External integration health",
+    response_model=dict,
+    description=(
+        "Live view of the two inbound upstream feeds and the outbound push "
+        "target: resolved URLs, cache hit rates, error counts, and whether a "
+        "push bearer token is configured. Use this first when the pipeline "
+        "looks quiet — a feed whose `errors` climbs while `hits` stays flat "
+        "means the upstream is unreachable or has changed its response shape."
+    ),
+)
+async def integrations() -> dict:
+    """Diagnostics for every external system this engine talks to."""
+    feeds = upstream.stats()
+    return {
+        "inbound_feeds": feeds,
+        "outbound_push": {
+            "url": marketplace_push.target_url(),
+            "token_configured": marketplace_push.is_configured(),
+        },
+        "catalog_ready": store.catalog_ready,
+        "catalog_size": store.catalog_size,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

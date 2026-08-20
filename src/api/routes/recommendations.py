@@ -17,16 +17,14 @@ All pipelines share the same context re-rankers from hybrid_ranker.py.
 
 from __future__ import annotations
 
-import asyncio
-import time as _time
 from datetime import datetime
 from typing import Optional
 
-import httpx
 from fastapi import APIRouter, BackgroundTasks, status
 from loguru import logger
 
 import src.module.cold_start as cold_start
+import src.module.upstream as upstream
 from src.api.schemas.event import (
     BasketPageRequest,
     HandsetAccessoriesRequest,
@@ -40,12 +38,7 @@ from src.api.schemas.event import (
 from src.module.collaborative import get_cf_candidates, get_item_similar_products
 from src.module.content_based import get_similar_products, get_taxon_products
 from src.module.feature_store import store
-from src.module.handset_feed import (
-    ACCESSORY_TAXON_SLUGS,
-    fetch_handset_feed,
-    filter_feed_by_taxon,
-    get_all_taxon_slugs,
-)
+from src.module.handset_feed import ACCESSORY_TAXON_SLUGS, get_all_taxon_slugs
 from src.module.hybrid_ranker import (
     DEVICE_TOP_N,
     RRF_K,
@@ -55,51 +48,9 @@ from src.module.hybrid_ranker import (
     _session_taxon_boost,
 )
 from src.module.metrics import metrics
+from src.module.upstream import CATALOG_FEED, flatten, select
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["placements"])
-
-try:
-    from config import (
-        TOKI_SHOP_FEED_CACHE_SIZE,
-        TOKI_SHOP_FEED_CACHE_TTL,
-        TOKI_SHOP_FEED_TIMEOUT,
-        TOKI_SHOP_FEED_URL,
-    )
-except ImportError:
-    TOKI_SHOP_FEED_URL = "http://10.21.60.94:9000/marketplace"
-    TOKI_SHOP_FEED_TIMEOUT = 1.0
-    TOKI_SHOP_FEED_CACHE_TTL = 120
-    TOKI_SHOP_FEED_CACHE_SIZE = 20000
-
-# account_id → (monotonic_ts, [{"productId": str, "taxonId": str}])
-_toki_feed_cache: dict[str, tuple[float, list[dict]]] = {}
-
-
-async def _fetch_toki_shop_feed(account_id: str) -> list[dict]:
-    """GET toki shop pre-computed feed. Returns [] on any error or timeout."""
-    now = _time.monotonic()
-    cached = _toki_feed_cache.get(account_id)
-    if cached and now - cached[0] < TOKI_SHOP_FEED_CACHE_TTL:
-        return cached[1]
-    try:
-        async with httpx.AsyncClient(timeout=TOKI_SHOP_FEED_TIMEOUT) as client:
-            resp = await client.get(f"{TOKI_SHOP_FEED_URL}/{account_id}")
-            resp.raise_for_status()
-            data = resp.json()
-        products: list[dict] = (
-            data
-            if isinstance(data, list)
-            else data.get("products", data.get("recommendations", []))
-        )
-        _toki_feed_cache[account_id] = (now, products)
-        if len(_toki_feed_cache) > TOKI_SHOP_FEED_CACHE_SIZE:
-            oldest = min(_toki_feed_cache, key=lambda k: _toki_feed_cache[k][0])
-            del _toki_feed_cache[oldest]
-        return products
-    except Exception as exc:
-        logger.debug(f"Toki shop feed unavailable for {account_id}: {exc}")
-        return []
-
 
 # ── RRF weights per placement ──────────────────────────────────────────────────
 # Taxon page: broad discovery — popularity matters more
@@ -199,33 +150,30 @@ async def recommend_taxon_page(
 
     effective_top_n = req.top_n or DEVICE_TOP_N.get(device_type, 20)
 
-    # ── Parallel fetch: toki shop feed + cold-start bridge ─────────────────────
-    # Both run concurrently; max latency = max(toki_timeout, cold_start_timeout) = 1s
-    toki_raw, cs_pids = await asyncio.gather(
-        _fetch_toki_shop_feed(req.account_id),
-        cold_start.fetch(req.account_id, top_n=40),
-    )
+    # ── Both upstream feeds, fetched concurrently ──────────────────────────────
+    # Catalog API (:9000) supplies prebuilt device slots; the legacy shop feed
+    # (:8018) covers the full taxonomy and seeds cold-start users.
+    # Wall-clock cost is max(timeouts), not the sum; either side degrades to {}.
+    catalog_feed, shop_feed = await upstream.fetch_both(req.account_id)
 
-    # ── Toki shop pre-computed feed (taxon placement only) ──────────────────
-    # Pull from 10.21.60.94:9000/marketplace/{account_id}, filter to this taxon.
-    # These slots are filled first; core engine fills the remainder.
-    toki_raw = await _fetch_toki_shop_feed(req.account_id)
-    toki_ids = [
-        p["productId"]
-        for p in toki_raw
-        if isinstance(p, dict)
-        and p.get("taxonId") == req.taxon_id
-        and p.get("productId")
-        and p["productId"] not in exclude
-    ][:effective_top_n]
-    exclude.update(toki_ids)  # core engine must not re-emit toki products
-    remaining_n = max(0, effective_top_n - len(toki_ids))
+    # Both upstreams key by taxon *slug*; the request carries a taxon *id*.
+    taxon_slug = store.taxon_id_to_name.get(req.taxon_id, "")
 
-    # ── Cold-start seeds (10.21.60.94:8018/api/recommendations) ─────────────
-    # Use former rec engine IDs as CBF seeds when core engine has no history.
+    # ── Prebuilt upstream slots, filled first; core engine fills the rest ──────
+    upstream_ids = select(catalog_feed, taxon_slug, exclude, effective_top_n)
+    exclude.update(upstream_ids)
+    if len(upstream_ids) < effective_top_n:
+        extra = select(
+            shop_feed, taxon_slug, exclude, effective_top_n - len(upstream_ids)
+        )
+        upstream_ids.extend(extra)
+        exclude.update(extra)
+    remaining_n = max(0, effective_top_n - len(upstream_ids))
+
+    # ── Cold-start seeds from the legacy shop feed ─────────────────────────────
     seed_products = store.get_user_top_products(req.account_id, top_n=10)
-    if not seed_products and cs_pids:
-        seed_products = [p for p in cs_pids if p not in exclude][:10]
+    if not seed_products:
+        seed_products = flatten(shop_feed, exclude, 10)
 
     # ── Pipeline 1: CBF from user seed products, filtered to this taxon
     cbf_raw = (
@@ -290,10 +238,15 @@ async def recommend_taxon_page(
     merged = _apply_shared_rerankers(merged, session, basket)
     core_ids = [pid for pid, _ in merged[:remaining_n]]
 
-    # ── Assemble: toki shop feed first, core engine fills remainder
-    final_ids = toki_ids + core_ids
-    cs_prefix = "cold+" if (not store.get_user_top_products(req.account_id, top_n=1) and cs_pids) else ""
-    strategy = f"toki+{cs_prefix}{core_strategy}" if toki_ids else f"{cs_prefix}{core_strategy}"
+    # ── Assemble: prebuilt upstream slots first, core engine fills the remainder
+    final_ids = upstream_ids + core_ids
+    parts = []
+    if upstream_ids:
+        parts.append("upstream")
+    if not store.get_user_top_products(req.account_id, top_n=1) and seed_products:
+        parts.append("cold")
+    parts.append(core_strategy)
+    strategy = "+".join(parts)
 
     metrics.record_recommendations(
         count=len(final_ids), strategy=strategy, endpoint="taxon", device=device_type
@@ -363,7 +316,7 @@ async def recommend_product_page(
 
     # ── Cold start: augment CBF seeds with former rec engine when CF is empty
     if not cf_candidates and cold_start.is_cold_start(req.account_id):
-        cs_pids = cold_start.read_cache(req.account_id, top_n=20)
+        cs_pids = await cold_start.fetch(req.account_id, top_n=20)
         if cs_pids:
             extra_cbf = get_similar_products(
                 [p for p in cs_pids if p not in exclude][:5],
@@ -401,7 +354,7 @@ async def recommend_product_page(
             strategy = "taxon_popular_fallback"
         # Last resort: cold-start products from former rec engine
         if not merged:
-            cs_pids = cold_start.read_cache(req.account_id, top_n=effective_top_n)
+            cs_pids = await cold_start.fetch(req.account_id, top_n=effective_top_n)
             merged = [(p, 1.0) for p in cs_pids if p not in exclude]
             if merged:
                 strategy = "cold_start_fallback"
@@ -467,12 +420,10 @@ async def recommend_basket_page(
 
     effective_top_n = req.top_n or DEVICE_TOP_N.get(device_type, 10)
 
-    # ── Cold start: fetch former rec engine seeds before CBF when user is new
+    # ── Cold start: seed from the legacy shop feed when the user is new
     cs_pids: list[str] = []
     if cold_start.is_cold_start(req.account_id):
-        cs_pids = cold_start.read_cache(req.account_id, top_n=20)
-
-    effective_top_n = req.top_n or DEVICE_TOP_N.get(device_type, 10)
+        cs_pids = await cold_start.fetch(req.account_id, top_n=20)
 
     # ── Pipeline 1: CBF from all basket items as seeds
     cbf_seed = all_basket + [p for p in cs_pids if p not in exclude][:5]
@@ -590,14 +541,17 @@ async def recommend_handset_accessories(
             if slug in store.taxon_name_to_id
         }
 
-    # ── External Marketplace API feed (accessory + earphones + watches) ──────
-    handset_feed = await fetch_handset_feed(req.account_id)
-    api_ids: list[str] = []
-    for slug in ACCESSORY_TAXON_SLUGS:
-        slot = filter_feed_by_taxon(handset_feed, slug, exclude, effective_top_n)
-        api_ids.extend(slot)
-        exclude.update(slot)
-    api_ids = api_ids[:effective_top_n]
+    # ── Upstream companion products (accessories + earphones + watches) ───────
+    # Round-robin across the three slugs so one category can't take every slot.
+    catalog_feed = await CATALOG_FEED.fetch(req.account_id)
+    api_ids = upstream.select_many(
+        catalog_feed,
+        ACCESSORY_TAXON_SLUGS,
+        exclude,
+        effective_top_n,
+        require_in_stock=req.require_in_stock,
+    )
+    exclude.update(api_ids)
     remaining_n = max(0, effective_top_n - len(api_ids))
 
     # ── Pipeline 1: CBF — TF-IDF similarity from handset product, accessory-scoped
@@ -706,9 +660,10 @@ async def recommend_handset_accessories(
     description=(
         "Returns personalised recommendations across all device categories "
         "(phones, tablets, wearables, earphones, accessories). "
-        "Each taxon slot is filled first from the external Marketplace catalogue API; "
-        "remaining slots are filled by the internal TF-IDF CBF + taxon popularity engine. "
-        "Taxon slugs correspond to HANDSET_FEED_MAP keys in config.py."
+        "Each taxon slot is filled first from the Marketplace Catalog API (:9000), "
+        "then the TOKI Shop feed (:8018), then the internal TF-IDF CBF + taxon "
+        "popularity engine. "
+        "Defaults to the six DEVICE_TAXON_SLUGS; any catalog taxon slug works."
     ),
 )
 async def recommend_handset_feed(
@@ -732,8 +687,13 @@ async def recommend_handset_feed(
     requested_slugs = req.taxon_slugs or get_all_taxon_slugs()
     global_exclude = set(req.exclude_product_ids)
 
-    # Fetch external Marketplace API feed once for all taxons
-    handset_feed = await fetch_handset_feed(req.account_id)
+    # Fetch both upstreams once, concurrently, for all requested taxons.
+    # Catalog API (:9000) covers the six device taxons; the legacy shop feed
+    # (:8018) covers everything else, so requests for e.g. "tv" still resolve.
+    catalog_feed, shop_feed = await upstream.fetch_both(req.account_id)
+    handset_feed = catalog_feed
+    if not seed_products:
+        seed_products = flatten(shop_feed, global_exclude, 15)
 
     taxon_feeds: list[HandsetFeedTaxonItem] = []
     all_served_ids: list[str] = []
@@ -743,15 +703,21 @@ async def recommend_handset_feed(
         taxon_id = store.taxon_name_to_id.get(slug)
         slot_exclude = global_exclude | set(all_served_ids)
 
-        # External API products for this taxon
-        api_slot = filter_feed_by_taxon(
-            handset_feed, slug, slot_exclude, req.top_n_per_taxon
-        )
-        remaining_n = max(0, req.top_n_per_taxon - len(api_slot))
+        # Upstream products for this taxon: catalog API first, then shop feed
+        api_slot = select(catalog_feed, slug, slot_exclude, req.top_n_per_taxon)
         slot_exclude.update(api_slot)
+        source = "catalog_api" if api_slot else "internal"
+        if len(api_slot) < req.top_n_per_taxon:
+            shop_slot = select(
+                shop_feed, slug, slot_exclude, req.top_n_per_taxon - len(api_slot)
+            )
+            if shop_slot:
+                source = "catalog_api+shop_feed" if api_slot else "shop_feed"
+                api_slot.extend(shop_slot)
+                slot_exclude.update(shop_slot)
+        remaining_n = max(0, req.top_n_per_taxon - len(api_slot))
 
         internal_ids: list[str] = []
-        source = "marketplace_api" if api_slot else "internal"
 
         if remaining_n > 0:
             if taxon_id:
@@ -805,7 +771,7 @@ async def recommend_handset_feed(
             )
         )
 
-    strategy = "marketplace_api+cbf+pop" if handset_feed else "cbf+pop"
+    strategy = "upstream+cbf+pop" if (catalog_feed or shop_feed) else "cbf+pop"
     metrics.record_recommendations(
         count=len(all_served_ids),
         strategy=strategy,

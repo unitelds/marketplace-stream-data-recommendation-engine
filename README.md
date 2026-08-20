@@ -2,7 +2,7 @@
 
 Real-time recommendation engine for the TOKI marketplace. Ingests engagement events from shop data streams, builds per-user intent profiles, and serves hybrid content-based + collaborative filtering + popularity recommendations across multiple product taxons and three distinct UI placement areas.
 
-**Current version:** `4.2.0` | **Environment:** `production` | **Port:** `8018`
+**Current version:** `4.3.0` | **Environment:** `production` | **Port:** `8018`
 
 ---
 
@@ -54,8 +54,8 @@ Shop Data Stream
 │                          │                                   │
 │  Catalog (PostgreSQL, synced every 10 min)                   │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │ 4,511 products │ TF-IDF (4511 × 30,000) │ 77 taxons   │  │
-│  │ taxon_id ↔ taxon_name maps (165 label entries)         │  │
+│  │ 4,914 products │ TF-IDF (4914 × 30,000) │ 79 taxons   │  │
+│  │ taxon_id ↔ taxon_name maps (167 label entries)         │  │
 │  └────────────────────────────────────────────────────────┘  │
 │                          │                                   │
 │  Three Retrieval Pipelines                                   │
@@ -278,7 +278,7 @@ Base URL: `http://0.0.0.0:8018` (local) | Interactive docs: `/docs`
 Liveness check. Always returns `200`.
 
 ```json
-{ "status": "ok", "catalog_ready": true, "version": "4.2.0" }
+{ "status": "ok", "catalog_ready": true, "version": "4.3.0" }
 ```
 
 ### `GET /api/v1/catalog/status`
@@ -548,7 +548,27 @@ All settings are in `config.py`. Override any value with the corresponding envir
 | `RECOMMENDATION_CACHE_TTL` | `TOKI_REC_CACHE_TTL` | `14400` | 4 hours |
 | `WORKERS` | `TOKI_WORKERS` | `24` | Gunicorn worker count |
 | `TOKI_API_KEYS` | `TOKI_API_KEYS` | — | Comma-separated `key:tier` pairs (see Auth) |
-| `MARKETPLACE_API_BASE_URL` | — | `http://10.21.60.94:9000/marketplace` | Shop feed push target |
+| `CATALOG_FEED_URL` | `TOKI_CATALOG_FEED_URL` | `http://10.21.60.94:9000/marketplace` | **Inbound** Marketplace Catalog API — handset-shop device feed |
+| `SHOP_FEED_URL` | `TOKI_SHOP_FEED_URL` | `http://10.21.60.94:8018/api/recommendations` | **Inbound** TOKI Shop Feed — legacy demographic engine, full taxonomy |
+| `MARKETPLACE_PUSH_URL` | `TOKI_MARKETPLACE_PUSH_URL` | `https://marketplace.toki.mn/ms/catalogue/v1/recommendation` | **Outbound** recommendation delivery |
+| `MARKETPLACE_PUSH_TOKEN` | `TOKI_MARKETPLACE_PUSH_TOKEN` | — | **Required.** Bearer token; delivery 401s without it |
+| — | `TOKI_AUTH_ENABLED` | `false` | Enforce `X-API-Key` on inbound requests |
+
+### External integrations
+
+Two **inbound** upstream feeds, both on `10.21.60.94`, both returning the same envelope
+`{"userId": ..., "taxonRecommendations": {"<slug>": ["<productId>", ...]}}`:
+
+| Port | Service | Coverage | Role |
+|---|---|---|---|
+| `9000` | Marketplace Catalog API (handset-shop feed) | 6 device taxons: handset · tablet · watch · earphones · accessory · cpe | Prebuilt device slots, filled first |
+| `8018` | TOKI Shop Feed (legacy demographic model) | full catalogue, ~80 taxons | Non-device taxons + cold-start seeds |
+
+One **outbound** target: `POST {MARKETPLACE_PUSH_URL}` with `Authorization: Bearer <token>`,
+payload `{"accountId": "<24-hex>", "products": [{"productId", "taxonId"}]}`.
+
+`GET /api/v1/integrations` reports the resolved URLs, per-feed cache hit rates,
+error counts, and whether the push token is configured.
 
 ### PostgreSQL credentials (`meta/pg.cred`)
 
@@ -660,13 +680,13 @@ The image uses `continuumio/miniconda3`, installs Oracle Instant Client, and run
 
 ```bash
 # Build
-docker build -t toki-rec-engine:v4.2.0 .
+docker build -t toki-rec-engine:v4.3.0 .
 
 # Run with env file
 docker run --rm \
   --env-file=$HOME/envs/marketplace.env \
   -p 8018:8018 \
-  toki-rec-engine:v4.2.0
+  toki-rec-engine:v4.3.0
 ```
 
 ### Dockerfile note
@@ -684,8 +704,8 @@ CMD ["gunicorn", "src.api.app:app",
 ### Create Release (auto-build CI)
 
 ```bash
-git tag v4.2.0
-git push origin v4.2.0
+git tag v4.3.0
+git push origin v4.3.0
 ```
 
 ---
