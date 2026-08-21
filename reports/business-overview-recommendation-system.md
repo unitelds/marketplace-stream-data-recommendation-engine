@@ -23,7 +23,7 @@ From a business lens, this capability is a **growth and efficiency lever**:
 
 ```mermaid
 flowchart LR
-    A[Customer Activity\nclicks, views, cart, orders] --> B[Intent Detection]
+    A["Customer Activity<br/>clicks, views, cart, orders"] --> B[Intent Detection]
     B --> C[Personalized Ranking]
     C --> D[Relevant Product Feed]
     D --> E[Higher Conversion]
@@ -81,7 +81,7 @@ flowchart TD
 
 ```mermaid
 graph LR
-    A[Catalog Sync\nEvery 10 min] --> B[Fresh Inventory Context]
+    A["Catalog Sync<br/>Every 10 min"] --> B[Fresh Inventory Context]
     C[Live Event Ingestion] --> D[Session Intent Updates]
     B --> E[Recommendation Engine]
     D --> E

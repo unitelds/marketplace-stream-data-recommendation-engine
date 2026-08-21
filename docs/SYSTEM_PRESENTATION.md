@@ -21,26 +21,26 @@ It runs **24 / 7**, learns **in real-time**, and personalises across **five dist
 ```mermaid
 graph TB
     subgraph SOURCES["Data Sources"]
-        S1["🛒 Shop Activity Stream\nCart - Orders - Wishlists - Views"]
-        S2["🗄️ Oracle Event Warehouse\nHistorical consumer events, 30 days"]
-        S3["📦 PostgreSQL Catalog\nProducts, Taxons, Stock, Prices"]
-        S4["📱 Marketplace Catalogue API\nHandset device feed, per-user"]
-        S5["🔗 Toki Shop Feed\nPre-computed taxon slots, per-user"]
+        S1["🛒 Shop Activity Stream<br/>Cart - Orders - Wishlists - Views"]
+        S2["🗄️ Oracle Event Warehouse<br/>Historical consumer events, 30 days"]
+        S3["📦 PostgreSQL Catalog<br/>Products, Taxons, Stock, Prices"]
+        S4["📱 Marketplace Catalogue API<br/>Handset device feed, per-user"]
+        S5["🔗 Toki Shop Feed<br/>Pre-computed taxon slots, per-user"]
     end
 
     subgraph ENGINE["Recommendation Engine"]
-        FE["🧠 Feature Store\nIn-memory, Per-user, Real-time"]
-        AL["⚙️ Algorithm Layer\nCBF, CF, Popularity, RRF Fusion"]
-        RR["🎯 Re-ranker\nContext, Basket, Budget, Diversity"]
+        FE["🧠 Feature Store<br/>In-memory, Per-user, Real-time"]
+        AL["⚙️ Algorithm Layer<br/>CBF, CF, Popularity, RRF Fusion"]
+        RR["🎯 Re-ranker<br/>Context, Basket, Budget, Diversity"]
         FE --> AL --> RR
     end
 
     subgraph PLACEMENTS["Placements"]
-        P1["🗂️ Category Page\nProduct Grid"]
-        P2["🔍 Product Page\nYou May Also Like"]
-        P3["🧺 Basket Page\nCross-Sell"]
-        P4["📡 Feed Push\nMulti-taxon Feed"]
-        P5["📱 Handset Page\nAccessories + Device Feed"]
+        P1["🗂️ Category Page<br/>Product Grid"]
+        P2["🔍 Product Page<br/>You May Also Like"]
+        P3["🧺 Basket Page<br/>Cross-Sell"]
+        P4["📡 Feed Push<br/>Multi-taxon Feed"]
+        P5["📱 Handset Page<br/>Accessories + Device Feed"]
     end
 
     S1 -->|real-time events| FE
@@ -70,26 +70,26 @@ flowchart LR
     end
 
     subgraph ORACLE["Oracle Warehouse"]
-        B1["Consumer Event History\n30 days · millions of rows\npoll every 60 s · batch 500"]
+        B1["Consumer Event History<br/>30 days · millions of rows<br/>poll every 60 s · batch 500"]
     end
 
     subgraph POSTGRES["PostgreSQL Catalog"]
-        C1["4,914 Products · 79 taxons\nPrices · Stock · Categories\nSpecs · Keywords · Grade"]
+        C1["4,914 Products · 79 taxons<br/>Prices · Stock · Categories<br/>Specs · Keywords · Grade"]
     end
 
     subgraph EXTERNAL["Upstream Feed APIs (10.21.60.94)"]
-        D1["📱 Marketplace Catalog API :9000\nGET /marketplace/{accountId}\nHandsets · Tablets · Watches\nEarphones · Accessories · CPE"]
-        D2["🔗 TOKI Shop Feed :8018\nGET /api/recommendations/{accountId}\nLegacy demographic model\nFull ~80-taxon coverage"]
+        D1["📱 Marketplace Catalog API :9000<br/>GET /marketplace/{accountId}<br/>Handsets · Tablets · Watches<br/>Earphones · Accessories · CPE"]
+        D2["🔗 TOKI Shop Feed :8018<br/>GET /api/recommendations/{accountId}<br/>Legacy demographic model<br/>Full ~80-taxon coverage"]
     end
 
-    A1 & A2 & A3 & A4 & A5 -->|POST /api/v1/events\nstream in real-time| ENG
+    A1 & A2 & A3 & A4 & A5 -->|"POST /api/v1/events<br/>stream in real-time"| ENG
     B1 -->|background poller| ENG
     C1 -->|sync every 10 min| ENG
     D1 -->|prebuilt device slots| ENG
     D2 -->|full taxonomy + cold-start seeds| ENG
-    ENG -->|POST /ms/catalogue/v1/recommendation\nBearer auth| OUT["🛍️ marketplace.toki.mn"]
+    ENG -->|"POST /ms/catalogue/v1/recommendation<br/>Bearer auth"| OUT["🛍️ marketplace.toki.mn"]
 
-    ENG(["🧠 Engine\nv4.3.0"])
+    ENG(["🧠 Engine<br/>v4.3.0"])
 ```
 
 ### Signal Weighting — Not All Events Are Equal
@@ -115,23 +115,23 @@ Three independent retrieval engines run in **parallel**, then their ranked lists
 
 ```mermaid
 flowchart TD
-    USER(["👤 User\naccount_id"])
+    USER(["👤 User<br/>account_id"])
 
     USER --> CBF
     USER --> CF
     USER --> POP
 
-    CBF["📄 Content-Based Filtering\n\nFinds products whose text description\n(name · specs · keywords · category)\nis most similar to what you've engaged\nwith — using TF-IDF cosine similarity\n30,000-token vocabulary · bigrams"]
+    CBF["📄 Content-Based Filtering<br/><br/>Finds products whose text description<br/>(name · specs · keywords · category)<br/>is most similar to what you've engaged<br/>with — using TF-IDF cosine similarity<br/>30,000-token vocabulary · bigrams"]
 
-    CF["👥 Collaborative Filtering\n\nFinds other shoppers who touched\nthe same products as you, then\nsurfaces what they also bought\nor liked — item-based co-interaction\nMax 200 co-users per seed product"]
+    CF["👥 Collaborative Filtering<br/><br/>Finds other shoppers who touched<br/>the same products as you, then<br/>surfaces what they also bought<br/>or liked — item-based co-interaction<br/>Max 200 co-users per seed product"]
 
-    POP["🔥 Popularity Fallback\n\nGlobal + category-scoped\ntrending products ranked by\ntotal interaction weight\nCold-start safety net"]
+    POP["🔥 Popularity Fallback<br/><br/>Global + category-scoped<br/>trending products ranked by<br/>total interaction weight<br/>Cold-start safety net"]
 
     CBF -->|ranked list| RRF
     CF -->|ranked list| RRF
     POP -->|ranked list| RRF
 
-    RRF["⚖️ RRF Fusion\nReciprocal Rank Fusion · K = 60\n\nCombines all three lists into\none optimised ranking — rewards\nproducts that rank well across\nmultiple algorithms consistently"]
+    RRF["⚖️ RRF Fusion<br/>Reciprocal Rank Fusion · K = 60<br/><br/>Combines all three lists into<br/>one optimised ranking — rewards<br/>products that rank well across<br/>multiple algorithms consistently"]
 ```
 
 ### RRF Algorithm Weights Per Placement
@@ -152,14 +152,14 @@ After candidate generation and RRF merge, five re-ranking passes shape every fin
 
 ```mermaid
 flowchart LR
-    MERGED["Merged\nCandidate List"]
+    MERGED["Merged<br/>Candidate List"]
 
-    MERGED --> R1["📍 Session Boost\n+25% for products whose\ncategory you just browsed\n(last 3 taxons in path)"]
-    R1 --> R2["🧺 Basket Awareness\nSame-category penalty × 0.6\nDifferent-taxon boost × 1.15"]
-    R2 --> R3["💰 Budget Filter\nLease limit checked?\nDemote price-tier > 1 by × 0.5"]
-    R3 --> R4["🎲 Intent Diversity\nIntent ≥ 8.0 → stay focused\nIntent ≤ 2.0 → inject variety"]
-    R4 --> R5["🏪 Shop Cap\nMax 5 products per shop\n(3 on basket panel)"]
-    R5 --> FINAL["✅ Final\nRecommendations"]
+    MERGED --> R1["📍 Session Boost<br/>+25% for products whose<br/>category you just browsed<br/>(last 3 taxons in path)"]
+    R1 --> R2["🧺 Basket Awareness<br/>Same-category penalty × 0.6<br/>Different-taxon boost × 1.15"]
+    R2 --> R3["💰 Budget Filter<br/>Lease limit checked?<br/>Demote price-tier > 1 by × 0.5"]
+    R3 --> R4["🎲 Intent Diversity<br/>Intent ≥ 8.0 → stay focused<br/>Intent ≤ 2.0 → inject variety"]
+    R4 --> R5["🏪 Shop Cap<br/>Max 5 products per shop<br/>(3 on basket panel)"]
+    R5 --> FINAL["✅ Final<br/>Recommendations"]
 ```
 
 ---
@@ -168,17 +168,17 @@ flowchart LR
 
 ```mermaid
 graph LR
-    ENG(["🧠 Engine\nv4.2.0"])
+    ENG(["🧠 Engine<br/>v4.2.0"])
 
-    ENG -->|Category page\nProduct grid| TP["🗂️ Taxon Page\n\nToki shop feed fills first\nCore CBF + CF + Popularity\nfills remainder\n45% · 30% · 25%"]
+    ENG -->|"Category page<br/>Product grid"| TP["🗂️ Taxon Page<br/><br/>Toki shop feed fills first<br/>Core CBF + CF + Popularity<br/>fills remainder<br/>45% · 30% · 25%"]
 
-    ENG -->|Product detail page\n'You May Also Like'| PP["🔍 Product Page\n\nTF-IDF cosine similarity\n+ CF co-interaction\n60% · 40%"]
+    ENG -->|"Product detail page<br/>'You May Also Like'"| PP["🔍 Product Page<br/><br/>TF-IDF cosine similarity<br/>+ CF co-interaction<br/>60% · 40%"]
 
-    ENG -->|Basket / Cart view\nCross-sell panel| BP["🧺 Basket Page\n\nCross-category boost\nCBF from all basket seeds\n40% · 35% · 25%"]
+    ENG -->|"Basket / Cart view<br/>Cross-sell panel"| BP["🧺 Basket Page<br/><br/>Cross-category boost<br/>CBF from all basket seeds<br/>40% · 35% · 25%"]
 
-    ENG -->|Proactive push\nto shop feed URL| FP["📡 Feed Push\n\nMulti-taxon feed per user\nTop 3 categories · 10 products\nPOSTed to shop endpoint"]
+    ENG -->|"Proactive push<br/>to shop feed URL"| FP["📡 Feed Push<br/><br/>Multi-taxon feed per user<br/>Top 3 categories · 10 products<br/>POSTed to shop endpoint"]
 
-    ENG -->|Phone · tablet · device page\nAccessories & device feed| HP["📱 Handset Pipeline\n\n① Compatible accessories\n   cases · chargers · earphones\n② Multi-taxon device feed\n   phones · tablets · watches"]
+    ENG -->|"Phone · tablet · device page<br/>Accessories & device feed"| HP["📱 Handset Pipeline<br/><br/>① Compatible accessories<br/>&nbsp;&nbsp;&nbsp;cases · chargers · earphones<br/>② Multi-taxon device feed<br/>&nbsp;&nbsp;&nbsp;phones · tablets · watches"]
 ```
 
 ---
@@ -199,23 +199,23 @@ is served — roughly 9% of catalog-feed IDs reference delisted SKUs.
 ```mermaid
 flowchart TD
     subgraph HSOURCES["Handset Data Sources"]
-        HA["📱 Marketplace Catalog API\n10.21.60.94:9000\nPer-user · cached 1 hour"]
-        HS["🔗 TOKI Shop Feed\n10.21.60.94:8018\nPer-user · cached 10 min"]
-        HB["🧠 Internal Engine\nCBF + CF + Popularity"]
+        HA["📱 Marketplace Catalog API<br/>10.21.60.94:9000<br/>Per-user · cached 1 hour"]
+        HS["🔗 TOKI Shop Feed<br/>10.21.60.94:8018<br/>Per-user · cached 10 min"]
+        HB["🧠 Internal Engine<br/>CBF + CF + Popularity"]
     end
 
     subgraph HTAXONS["Device Category Slots"]
-        T1["📱 handset-cellphone\nSmartphones"]
-        T2["📟 tablet\nTablets"]
-        T3["⌚ watch-and-smart-watches\nWearables"]
-        T4["🎧 headphones-earphones\nEarphones & Headphones"]
-        T5["🔌 handset-accessory\nCases · Chargers · Bands"]
-        T6["📡 cpe\nRouters · Modems"]
+        T1["📱 handset-cellphone<br/>Smartphones"]
+        T2["📟 tablet<br/>Tablets"]
+        T3["⌚ watch-and-smart-watches<br/>Wearables"]
+        T4["🎧 headphones-earphones<br/>Earphones & Headphones"]
+        T5["🔌 handset-accessory<br/>Cases · Chargers · Bands"]
+        T6["📡 cpe<br/>Routers · Modems"]
     end
 
     subgraph HENDPOINTS["Endpoints"]
-        E1["POST /recommendations/handset/accessories\nFor a specific phone product page\nReturns compatible accessories"]
-        E2["POST /recommendations/handset/feed\nPer-user full device category feed\nAll 6 taxon slots"]
+        E1["POST /recommendations/handset/accessories<br/>For a specific phone product page<br/>Returns compatible accessories"]
+        E2["POST /recommendations/handset/feed<br/>Per-user full device category feed<br/>All 6 taxon slots"]
     end
 
     HA -->|fills slots first| T1 & T2 & T3 & T4 & T5 & T6
@@ -302,29 +302,29 @@ flowchart TD
 ```mermaid
 graph LR
     subgraph INGEST["Event Ingestion"]
-        I1["POST /api/v1/events\nShop activity stream"]
-        I2["POST /api/v1/consumer-events\nOracle consumer events"]
+        I1["POST /api/v1/events<br/>Shop activity stream"]
+        I2["POST /api/v1/consumer-events<br/>Oracle consumer events"]
     end
 
     subgraph INFERENCE["On-Demand Inference"]
-        N1["POST /api/v1/infer\nSingle-taxon recommendation"]
-        N2["POST /api/v1/feed\nMulti-taxon feed"]
-        N3["POST /api/v1/feed/push\nGenerate + push to shop"]
+        N1["POST /api/v1/infer<br/>Single-taxon recommendation"]
+        N2["POST /api/v1/feed<br/>Multi-taxon feed"]
+        N3["POST /api/v1/feed/push<br/>Generate + push to shop"]
     end
 
     subgraph PLACEMENTS2["Placement Endpoints"]
-        L1["POST /recommendations/taxon\nCategory page grid"]
-        L2["POST /recommendations/product\nProduct detail panel"]
-        L3["POST /recommendations/basket\nCart cross-sell"]
-        L4["POST /recommendations/handset/accessories\nPhone page accessories"]
-        L5["POST /recommendations/handset/feed\nDevice category feed"]
+        L1["POST /recommendations/taxon<br/>Category page grid"]
+        L2["POST /recommendations/product<br/>Product detail panel"]
+        L3["POST /recommendations/basket<br/>Cart cross-sell"]
+        L4["POST /recommendations/handset/accessories<br/>Phone page accessories"]
+        L5["POST /recommendations/handset/feed<br/>Device category feed"]
     end
 
     subgraph OPS["Operations"]
-        O1["GET /api/v1/health\nLiveness check"]
-        O2["GET /api/v1/catalog/status\nSync state + TF-IDF stats"]
-        O3["POST /api/v1/catalog/sync\nManual re-sync trigger"]
-        O4["GET /api/v1/metrics\nAggregated worker metrics"]
+        O1["GET /api/v1/health<br/>Liveness check"]
+        O2["GET /api/v1/catalog/status<br/>Sync state + TF-IDF stats"]
+        O3["POST /api/v1/catalog/sync<br/>Manual re-sync trigger"]
+        O4["GET /api/v1/metrics<br/>Aggregated worker metrics"]
     end
 ```
 
@@ -371,31 +371,31 @@ sequenceDiagram
 ```mermaid
 graph TD
     subgraph RUNTIME["App Server · Production  80GB RAM · 32 CPU · 1TB Storage"]
-        GUN["Gunicorn\n24 workers · port 8018\nmax 5,000 requests/worker"]
-        UVW["Uvicorn Workers\nasync I/O · 1,000 peak users"]
-        MEM["In-Memory Feature Store\nSession state · TF-IDF index\n~8 MB sparse after compression"]
+        GUN["Gunicorn<br/>24 workers · port 8018<br/>max 5,000 requests/worker"]
+        UVW["Uvicorn Workers<br/>async I/O · 1,000 peak users"]
+        MEM["In-Memory Feature Store<br/>Session state · TF-IDF index<br/>~8 MB sparse after compression"]
         GUN --> UVW
         UVW <--> MEM
     end
 
     subgraph PGSERVER["PostgreSQL Server  8 CPU · 16GB RAM · ~150GB used"]
-        PGP["Production DB\nmarketplace\nCatalog v3 · Delivery logs"]
-        PGS["Staging DB\nmarketplace_staging\nCatalog v3_staging · Test logs"]
+        PGP["Production DB<br/>marketplace<br/>Catalog v3 · Delivery logs"]
+        PGS["Staging DB<br/>marketplace_staging<br/>Catalog v3_staging · Test logs"]
     end
 
     subgraph EXTSTORAGE["External Data"]
-        ORA["Oracle DB\nConsumer event history\n24 h lookback · MN timezone"]
+        ORA["Oracle DB<br/>Consumer event history<br/>24 h lookback · MN timezone"]
     end
 
     subgraph EXTAPIS["Upstream Feed APIs"]
-        MKT["Marketplace Catalog API\n10.21.60.94:9000\nCache 3,600 s · 20,000 users"]
-        TF["TOKI Shop Feed\n10.21.60.94:8018\nCache 600 s · 50,000 users"]
+        MKT["Marketplace Catalog API<br/>10.21.60.94:9000<br/>Cache 3,600 s · 20,000 users"]
+        TF["TOKI Shop Feed<br/>10.21.60.94:8018<br/>Cache 600 s · 50,000 users"]
     end
 
     subgraph JOBS["Background Jobs (per worker)"]
-        CS["Catalog Sync\nevery 10 min"]
-        OP["Oracle Poller\nevery 60 s"]
-        DQ["Delivery Log Writer\nevery 5 s · batch 200"]
+        CS["Catalog Sync<br/>every 10 min"]
+        OP["Oracle Poller<br/>every 60 s"]
+        DQ["Delivery Log Writer<br/>every 5 s · batch 200"]
     end
 
     UVW <-.->|timeout 1 s| TF
@@ -441,38 +441,44 @@ graph TD
 ## Summary
 
 ```mermaid
-mindmap
-  root((TOKI Rec Engine v4.2))
-    Data In
-      Shop stream events
-      Oracle event history
-      PostgreSQL catalog
-      Marketplace Catalogue API
-      Toki Shop Feed
-    Algorithms
-      Content-Based Filtering
-      Collaborative Filtering
-      Popularity Fallback
-      RRF Fusion
-    Personalization
-      Session taxon path
-      Basket awareness
-      Budget signals
-      Intent level
-      Device adaptation
-    Placements
-      Category page grid
-      Product page panel
-      Basket cross-sell
-      Proactive feed push
-      Handset accessories
-      Device category feed
-    Output
-      Ordered product IDs
-      Strategy metadata
-      Intent score
-      Source tagging
-      Device-tuned count
+graph LR
+    ROOT(["TOKI Rec Engine<br/>v4.2"])
+
+    ROOT --> M1["Data In"]
+    ROOT --> M2["Algorithms"]
+    ROOT --> M3["Personalization"]
+    ROOT --> M4["Placements"]
+    ROOT --> M5["Output"]
+
+    M1 --> M1A["Shop stream events"]
+    M1 --> M1B["Oracle event history"]
+    M1 --> M1C["PostgreSQL catalog"]
+    M1 --> M1D["Marketplace Catalogue API"]
+    M1 --> M1E["Toki Shop Feed"]
+
+    M2 --> M2A["Content-Based Filtering"]
+    M2 --> M2B["Collaborative Filtering"]
+    M2 --> M2C["Popularity Fallback"]
+    M2 --> M2D["RRF Fusion"]
+
+    M3 --> M3A["Session taxon path"]
+    M3 --> M3B["Basket awareness"]
+    M3 --> M3C["Budget signals"]
+    M3 --> M3D["Intent level"]
+    M3 --> M3E["Device adaptation"]
+
+    M4 --> M4A["Category page grid"]
+    M4 --> M4B["Product page panel"]
+    M4 --> M4C["Basket cross-sell"]
+    M4 --> M4D["Proactive feed push"]
+    M4 --> M4E["Handset accessories"]
+    M4 --> M4F["Device category feed"]
+
+    M5 --> M5A["Ordered product IDs"]
+    M5 --> M5B["Strategy metadata"]
+    M5 --> M5C["Intent score"]
+    M5 --> M5D["Source tagging"]
+    M5 --> M5E["Device-tuned count"]
 ```
 
 ---
